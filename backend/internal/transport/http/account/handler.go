@@ -127,10 +127,12 @@ func (p *accountSyncPipeline) reportProgress() {
 
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/account-families", h.listFamilies)
+	router.PATCH("/account-families/batch/proxy", h.batchUpdateFamilyProxy)
 	router.PATCH("/account-families/:id/proxy", h.updateFamilyProxy)
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
+	router.POST("/account-imports", h.importAccountFamilies)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -171,6 +173,12 @@ type familyProxyRequest struct {
 	ClearProxy bool    `json:"clearProxy"`
 }
 
+type batchFamilyProxyRequest struct {
+	IDs        []string `json:"ids" binding:"required"`
+	ProxyID    *uint64  `json:"proxyId,string"`
+	ClearProxy bool     `json:"clearProxy"`
+}
+
 type batchUpdateRequest struct {
 	IDs              []string `json:"ids" binding:"required"`
 	Provider         string   `json:"provider" binding:"required"`
@@ -195,6 +203,57 @@ type webConsoleSyncRequest struct {
 	IDs      []string                          `json:"ids"`
 	All      bool                              `json:"all"`
 	Strategy accountapp.WebConsoleSyncStrategy `json:"strategy"`
+}
+
+// accountFamilyImportRequest 表示外部系统批量导入逻辑账号的请求体。
+type accountFamilyImportRequest struct {
+	// Accounts 是本次导入的完整逻辑账号集合。
+	Accounts []accountFamilyImportItemRequest `json:"accounts" binding:"required"`
+}
+
+// accountFamilyImportItemRequest 表示一条外部账号的最小凭据字段。
+type accountFamilyImportItemRequest struct {
+	// Email 是逻辑账号展示邮箱。
+	Email string `json:"email"`
+	// AccessToken 是 Build OAuth access token。
+	AccessToken string `json:"access_token"`
+	// RefreshToken 是 Build OAuth refresh token。
+	RefreshToken string `json:"refresh_token"`
+	// SSOToken 是 Web 与 Console 共用的 SSO token。
+	SSOToken string `json:"sso_token"`
+	// ProxyURL 是匹配 IP 管理代理的完整地址。
+	ProxyURL string `json:"proxy_url"`
+}
+
+// accountFamilyImportBatchResponse 表示外部批量导入的响应体。
+type accountFamilyImportBatchResponse struct {
+	Total     int                               `json:"total"`
+	Succeeded int                               `json:"succeeded"`
+	Failed    int                               `json:"failed"`
+	Results   []accountFamilyImportItemResponse `json:"results"`
+}
+
+// accountFamilyImportItemResponse 表示一条逻辑账号的导入结果。
+type accountFamilyImportItemResponse struct {
+	Index     int                                    `json:"index"`
+	Status    string                                 `json:"status"`
+	Code      string                                 `json:"code,omitempty"`
+	Message   string                                 `json:"message,omitempty"`
+	FamilyID  string                                 `json:"family_id,omitempty"`
+	Proxy     *accountFamilyImportProxyResponse      `json:"proxy,omitempty"`
+	Accounts  map[string]accountFamilyImportAccountResponse `json:"accounts,omitempty"`
+}
+
+// accountFamilyImportProxyResponse 表示成功匹配的代理摘要。
+type accountFamilyImportProxyResponse struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// accountFamilyImportAccountResponse 表示一条 Provider 成员的写入结果。
+type accountFamilyImportAccountResponse struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
 type buildConversionResponse struct {
@@ -384,7 +443,11 @@ func (h *Handler) list(c *gin.Context) {
 // 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
 func (h *Handler) listFamilies(c *gin.Context) {
 	page, pageSize := pagination(c)
-	values, total, err := h.service.ListFamilies(c.Request.Context(), page, pageSize, c.Query("search"))
+	values, total, err := h.service.ListFamilies(c.Request.Context(), page, pageSize, c.Query("search"), c.Query("proxyBinding"))
+	if errors.Is(err, accountapp.ErrInvalidFilter) {
+		response.Error(c, http.StatusBadRequest, "invalidFilter", "逻辑账号筛选条件无效")
+		return
+	}
 	if err != nil {
 		response.Error(c, http.StatusInternalServerError, "accountFamilyListFailed", "读取逻辑账号失败")
 		return
@@ -413,6 +476,69 @@ func (h *Handler) updateFamilyProxy(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"updated": true})
+}
+
+// batchUpdateFamilyProxy 在单次事务内绑定、切换或解除当前页勾选账号组的固定代理。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) batchUpdateFamilyProxy(c *gin.Context) {
+	var request batchFamilyProxyRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	ids, err := parseIDs(request.IDs)
+	if err != nil {
+		response.Error(c, http.StatusBadRequest, "invalidId", err.Error())
+		return
+	}
+	updated, err := h.service.BatchUpdateFamilyProxy(c.Request.Context(), ids, request.ProxyID, request.ClearProxy)
+	if err != nil {
+		h.writeServiceError(c, "accountFamilyBatchProxyUpdateFailed", err, http.StatusInternalServerError, "批量更新逻辑账号代理失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"updated": updated})
+}
+
+// importAccountFamilies 接收管理员鉴权的外部批量导入请求，并返回逐条原子写入结果。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) importAccountFamilies(c *gin.Context) {
+	var request accountFamilyImportRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	inputs := make([]accountapp.AccountFamilyImportInput, 0, len(request.Accounts))
+	for _, item := range request.Accounts {
+		inputs = append(inputs, accountapp.AccountFamilyImportInput{
+			Email: item.Email, AccessToken: item.AccessToken, RefreshToken: item.RefreshToken,
+			SSOToken: item.SSOToken, ProxyURL: item.ProxyURL,
+		})
+	}
+	result, err := h.service.ImportAccountFamilies(c.Request.Context(), inputs)
+	if err != nil {
+		h.writeServiceError(c, "accountFamilyImportFailed", err, http.StatusInternalServerError, "导入逻辑账号失败")
+		return
+	}
+	response.Success(c, http.StatusOK, newAccountFamilyImportResponse(result))
+}
+
+// newAccountFamilyImportResponse 将应用层导入结果转换为不暴露敏感凭据的 HTTP DTO。
+// 参数 value 为应用层批量结果；返回使用字符串 ID 和稳定字段名的响应体。
+func newAccountFamilyImportResponse(value accountapp.AccountFamilyImportBatchResult) accountFamilyImportBatchResponse {
+	result := accountFamilyImportBatchResponse{Total: value.Total, Succeeded: value.Succeeded, Failed: value.Failed, Results: make([]accountFamilyImportItemResponse, 0, len(value.Results))}
+	for _, item := range value.Results {
+		responseItem := accountFamilyImportItemResponse{Index: item.Index, Status: item.Status, Code: item.Code, Message: item.Message}
+		if item.FamilyID != 0 {
+			responseItem.FamilyID = strconv.FormatUint(item.FamilyID, 10)
+			responseItem.Proxy = &accountFamilyImportProxyResponse{ID: strconv.FormatUint(item.ProxyID, 10), Name: item.ProxyName}
+			responseItem.Accounts = make(map[string]accountFamilyImportAccountResponse, len(item.Accounts))
+			for providerValue, accountValue := range item.Accounts {
+				responseItem.Accounts[string(providerValue)] = accountFamilyImportAccountResponse{ID: strconv.FormatUint(accountValue.ID, 10), Status: accountValue.Status}
+			}
+		}
+		result.Results = append(result.Results, responseItem)
+	}
+	return result
 }
 
 func (h *Handler) summary(c *gin.Context) {

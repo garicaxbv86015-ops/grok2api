@@ -20,6 +20,14 @@ type AccountUpsertResult struct {
 	Created bool
 }
 
+// AccountFamilyUpsertResult 表示一次逻辑账号组三 Provider 原子写入结果。
+type AccountFamilyUpsertResult struct {
+	// FamilyID 是三种 Provider 凭据共同归属的逻辑账号组标识。
+	FamilyID uint64
+	// Accounts 按输入顺序返回各 Provider 凭据的写入结果。
+	Accounts []AccountUpsertResult
+}
+
 // AccountRepository 定义 OAuth 账号和额度快照持久化能力。
 type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)
@@ -41,8 +49,10 @@ type AccountRepository interface {
 	HasActive(ctx context.Context, provider account.Provider) (bool, error)
 	ListRoutingCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error)
 	Get(ctx context.Context, id uint64) (account.Credential, error)
-	// SetFamilyProxy 更新整个逻辑账号组的固定代理绑定，proxyID 为 nil 时解除绑定。
+	// SetFamilyProxy 更新单个逻辑账号组的固定代理；ctx 为上下文，familyID 为账号组标识，proxyID 为 nil 时解除绑定；返回写入错误。
 	SetFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64) error
+	// SetFamilyProxies 在单次事务内更新多个账号组；ctx 为上下文，familyIDs 为组标识，proxyID 为 nil 时解除绑定；返回更新数和错误。
+	SetFamilyProxies(ctx context.Context, familyIDs []uint64, proxyID *uint64) (int64, error)
 	LinkWebToBuild(ctx context.Context, webAccountID, buildAccountID uint64) error
 	GetBillings(ctx context.Context, accountIDs []uint64) (map[uint64]account.Billing, error)
 	GetQuotaRecoveries(ctx context.Context, accountIDs []uint64) (map[uint64]account.QuotaRecovery, error)
@@ -74,6 +84,8 @@ type AccountRepository interface {
 	ReplaceQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow) error
 	SaveQuotaWindows(ctx context.Context, accountID uint64, tier account.WebTier, syncedAt time.Time, values []account.QuotaWindow) error
 	UpsertManyByIdentity(ctx context.Context, values []account.Credential) ([]AccountUpsertResult, error)
+	// UpsertAccountFamily 原子写入逻辑账号；ctx 为上下文，values 为同组 Provider 凭据，proxyID 为代理标识；返回组和成员写入结果及错误。
+	UpsertAccountFamily(ctx context.Context, values []account.Credential, proxyID uint64) (AccountFamilyUpsertResult, error)
 	DecrementQuotaWindow(ctx context.Context, accountID uint64, mode string, now time.Time) (bool, error)
 	ExhaustQuotaWindow(ctx context.Context, accountID uint64, mode string, resetAt *time.Time, now time.Time) error
 	ListDueQuotaWindows(ctx context.Context, now time.Time, limit int) ([]account.QuotaWindow, error)

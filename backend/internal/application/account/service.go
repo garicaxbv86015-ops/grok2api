@@ -2,9 +2,11 @@ package account
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +55,8 @@ const (
 	credentialImportChunkSize                 = 100
 	maxBuildConversionAccounts                = 1000
 	maxWebConsoleSyncAccounts                 = 1000
+	maxAccountFamilyImportAccounts            = 1000
+	maxAccountFamilyImportCredentialBytes     = 32 << 10
 	accountTaskBatchSize                      = 1000
 )
 
@@ -135,6 +139,81 @@ type ImportResult struct {
 	Skipped    int
 	AccountIDs []uint64
 }
+
+// AccountFamilyImportInput 表示外部系统导入一个完整逻辑账号所需的最小凭据。
+type AccountFamilyImportInput struct {
+	// Email 是逻辑账号和三种 Provider 成员的展示名称。
+	Email string
+	// AccessToken 是 Grok Build OAuth access token。
+	AccessToken string
+	// RefreshToken 是 Grok Build OAuth refresh token。
+	RefreshToken string
+	// SSOToken 是 Grok Web 和 Grok Console 共用的 SSO token。
+	SSOToken string
+	// ProxyURL 是用于匹配 IP 管理现有代理的完整地址。
+	ProxyURL string
+}
+
+// AccountFamilyImportAccountResult 表示一条 Provider 凭据的写入结果。
+type AccountFamilyImportAccountResult struct {
+	// ID 是写入后的 Provider 账号标识。
+	ID uint64
+	// Status 是 created 或 updated。
+	Status string
+}
+
+// AccountFamilyImportItemResult 表示批量导入中一条逻辑账号的处理结果。
+type AccountFamilyImportItemResult struct {
+	// Index 是请求 accounts 数组中的零基下标。
+	Index int
+	// Status 是 created、updated 或 failed。
+	Status string
+	// Code 是失败时返回的稳定错误码。
+	Code string
+	// Message 是不包含敏感凭据的错误说明。
+	Message string
+	// FamilyID 是成功写入的逻辑账号组标识。
+	FamilyID uint64
+	// ProxyID 是成功匹配的代理标识。
+	ProxyID uint64
+	// ProxyName 是成功匹配的代理名称。
+	ProxyName string
+	// Accounts 按 Provider 返回成员账号结果。
+	Accounts map[accountdomain.Provider]AccountFamilyImportAccountResult
+}
+
+// AccountFamilyImportBatchResult 表示外部批量导入的汇总和逐条结果。
+type AccountFamilyImportBatchResult struct {
+	// Total 是请求账号总数。
+	Total int
+	// Succeeded 是成功账号数。
+	Succeeded int
+	// Failed 是失败账号数。
+	Failed int
+	// Results 是与请求顺序一致的逐条结果。
+	Results []AccountFamilyImportItemResult
+}
+
+const (
+	AccountFamilyImportCreated        = "created"
+	AccountFamilyImportUpdated        = "updated"
+	AccountFamilyImportFailed         = "failed"
+	AccountFamilyImportInvalid        = "invalid_credential"
+	AccountFamilyImportProxyNotFound  = "proxy_not_found"
+	AccountFamilyImportProxyAmbiguous = "proxy_ambiguous"
+	AccountFamilyImportConflict       = "account_family_conflict"
+	AccountFamilyImportInternal       = "import_failed"
+)
+
+// accountFamilyImportFailure 保存单条导入可安全返回给调用方的错误码和说明。
+type accountFamilyImportFailure struct {
+	code    string
+	message string
+}
+
+// Error 返回不包含敏感凭据的导入失败说明。
+// 无参数；返回错误文本。
+func (e *accountFamilyImportFailure) Error() string { return e.message }
 
 type BuildConversionStrategy string
 
@@ -363,11 +442,15 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 }
 
 // ListFamilies 分页返回逻辑账号组及其 Web、Build、Console 成员摘要。
-// 参数 ctx 为请求上下文，page 为页码，pageSize 为每页数量，search 为成员搜索词；返回账号组、总数和错误。
-func (s *Service) ListFamilies(ctx context.Context, page, pageSize int, search string) ([]accountdomain.Family, int64, error) {
+// 参数 ctx 为请求上下文，page 为页码，pageSize 为每页数量，search 为成员或代理搜索词，proxyBinding 为绑定状态；返回账号组、总数和错误。
+func (s *Service) ListFamilies(ctx context.Context, page, pageSize int, search, proxyBinding string) ([]accountdomain.Family, int64, error) {
+	if !oneOf(proxyBinding, "", "bound", "unbound") {
+		return nil, 0, ErrInvalidFilter
+	}
 	page, pageSize = normalizePage(page, pageSize)
 	return s.accounts.ListFamilies(ctx, repository.AccountFamilyListQuery{
 		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search},
+		Filter: repository.AccountFamilyListFilter{ProxyBinding: proxyBinding},
 	})
 }
 
@@ -377,19 +460,44 @@ func (s *Service) UpdateFamilyProxy(ctx context.Context, familyID uint64, proxyI
 	if familyID == 0 {
 		return ErrNotFound
 	}
-	if proxyID != nil && clear {
-		return invalidInput("proxyId 与 clearProxy 不能同时设置")
-	}
-	if proxyID == nil && !clear {
-		return invalidInput("必须选择代理或解除绑定")
-	}
-	if err := s.validateProxyBinding(ctx, proxyID); err != nil {
+	proxyID, err := s.resolveFamilyProxyBinding(ctx, proxyID, clear)
+	if err != nil {
 		return err
 	}
-	if clear {
-		proxyID = nil
-	}
 	return mapRepositoryError(s.accounts.SetFamilyProxy(ctx, familyID, proxyID))
+}
+
+// BatchUpdateFamilyProxy 在单次事务内更新手动勾选的逻辑账号组代理。
+// 参数 ctx 为请求上下文，familyIDs 为账号组标识，proxyID 为目标代理，clear 表示解绑；返回更新数量和错误。
+func (s *Service) BatchUpdateFamilyProxy(ctx context.Context, familyIDs []uint64, proxyID *uint64, clear bool) (int64, error) {
+	familyIDs, err := normalizeFamilyIDs(familyIDs)
+	if err != nil {
+		return 0, err
+	}
+	proxyID, err = s.resolveFamilyProxyBinding(ctx, proxyID, clear)
+	if err != nil {
+		return 0, err
+	}
+	updated, err := s.accounts.SetFamilyProxies(ctx, familyIDs, proxyID)
+	return updated, mapRepositoryError(err)
+}
+
+// resolveFamilyProxyBinding 校验绑定或解绑请求并返回最终应写入的代理标识。
+// 参数 ctx 为请求上下文，proxyID 为目标代理，clear 表示解绑；返回可写入的代理标识和业务错误。
+func (s *Service) resolveFamilyProxyBinding(ctx context.Context, proxyID *uint64, clear bool) (*uint64, error) {
+	if proxyID != nil && clear {
+		return nil, invalidInput("proxyId 与 clearProxy 不能同时设置")
+	}
+	if proxyID == nil && !clear {
+		return nil, invalidInput("必须选择代理或解除绑定")
+	}
+	if err := s.validateProxyBinding(ctx, proxyID); err != nil {
+		return nil, err
+	}
+	if clear {
+		return nil, nil
+	}
+	return proxyID, nil
 }
 
 func oneOf(value string, allowed ...string) bool {
@@ -707,6 +815,207 @@ func (s *Service) ImportConsoleCredentialDocumentsWithProgress(ctx context.Conte
 		return ImportResult{}, fmt.Errorf("Grok Console Provider 未注册")
 	}
 	return s.importCredentialDocumentsWithProgress(ctx, adapter, documents, observer, progress)
+}
+
+// ImportAccountFamilies 批量导入完整逻辑账号，并按单条事务生成三种 Provider 凭据和代理绑定。
+// 参数 ctx 为请求上下文，inputs 为外部系统提交的账号集合；返回逐条结果和批次级基础设施错误。
+func (s *Service) ImportAccountFamilies(ctx context.Context, inputs []AccountFamilyImportInput) (AccountFamilyImportBatchResult, error) {
+	// 1. 先校验批次级参数和必需依赖，批次无效时不处理任何账号。
+	if len(inputs) == 0 {
+		return AccountFamilyImportBatchResult{}, invalidInput("accounts 不能为空")
+	}
+	if len(inputs) > maxAccountFamilyImportAccounts {
+		return AccountFamilyImportBatchResult{}, fmt.Errorf("%w: 单次最多导入 %d 个逻辑账号", ErrImportLimit, maxAccountFamilyImportAccounts)
+	}
+	if s.accounts == nil || s.proxies == nil || s.providers == nil || s.cipher == nil {
+		return AccountFamilyImportBatchResult{}, errors.New("逻辑账号导入服务未初始化")
+	}
+	buildCodec, buildOK := s.providers.CredentialCodec(accountdomain.ProviderBuild)
+	webCodec, webOK := s.providers.CredentialCodec(accountdomain.ProviderWeb)
+	consoleCodec, consoleOK := s.providers.CredentialCodec(accountdomain.ProviderConsole)
+	if !buildOK || !webOK || !consoleOK {
+		return AccountFamilyImportBatchResult{}, errors.New("逻辑账号导入所需 Provider 未注册")
+	}
+	// 2. 一次性建立启用代理的安全匹配索引，避免每条账号重复解密和读库。
+	proxyMatches, err := s.loadAccountFamilyImportProxies(ctx)
+	if err != nil {
+		return AccountFamilyImportBatchResult{}, err
+	}
+	result := AccountFamilyImportBatchResult{Total: len(inputs), Results: make([]AccountFamilyImportItemResult, 0, len(inputs))}
+	// 3. 每条账号独立校验并以单个事务写入，某条失败不影响其他条目。
+	for index, input := range inputs {
+		if err := ctx.Err(); err != nil {
+			return AccountFamilyImportBatchResult{}, err
+		}
+		item, importErr := s.importOneAccountFamily(ctx, input, proxyMatches, buildCodec, webCodec, consoleCodec)
+		item.Index = index
+		if importErr != nil {
+			failure := &accountFamilyImportFailure{code: AccountFamilyImportInternal, message: "导入逻辑账号失败"}
+			var safeFailure *accountFamilyImportFailure
+			if errors.As(importErr, &safeFailure) {
+				failure = safeFailure
+			} else {
+				s.logger.Error("account_family_import_failed", "index", index, "error", importErr)
+			}
+			item.Status = AccountFamilyImportFailed
+			item.Code = failure.code
+			item.Message = failure.message
+			result.Failed++
+		} else {
+			result.Succeeded++
+		}
+		result.Results = append(result.Results, item)
+	}
+	// 4. 至少一条写入成功时唤醒凭据刷新器，使新凭据及时进入调度。
+	if result.Succeeded > 0 {
+		s.WakeCredentialRefresh()
+	}
+	return result, nil
+}
+
+// accountFamilyImportProxy 表示已按完整地址建立索引的代理安全摘要。
+type accountFamilyImportProxy struct {
+	id   uint64
+	name string
+}
+
+// loadAccountFamilyImportProxies 解密并规范化启用代理，供单个批次复用匹配索引。
+// 参数 ctx 为请求上下文；返回以完整代理地址为键的候选集合和基础设施错误。
+func (s *Service) loadAccountFamilyImportProxies(ctx context.Context) (map[string][]accountFamilyImportProxy, error) {
+	values, err := s.proxies.ListEnabled(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string][]accountFamilyImportProxy, len(values))
+	for _, value := range values {
+		decrypted, err := s.cipher.Decrypt(value.EncryptedURL)
+		if err != nil {
+			return nil, fmt.Errorf("解密代理 %d: %w", value.ID, err)
+		}
+		normalized, err := egressapp.NormalizeProxyURL(decrypted)
+		if err != nil || normalized == "" {
+			return nil, fmt.Errorf("代理 %d 的地址无效", value.ID)
+		}
+		result[normalized] = append(result[normalized], accountFamilyImportProxy{id: value.ID, name: value.Name})
+	}
+	return result, nil
+}
+
+// importOneAccountFamily 处理一条账号的校验、代理匹配、凭据解析和事务写入。
+// 参数 ctx 为请求上下文，input 为账号数据，proxyMatches 为代理索引，三个 codec 为 Provider 凭据解析器；返回逐条结果和安全错误。
+func (s *Service) importOneAccountFamily(ctx context.Context, input AccountFamilyImportInput, proxyMatches map[string][]accountFamilyImportProxy, buildCodec, webCodec, consoleCodec provider.CredentialCodecAdapter) (AccountFamilyImportItemResult, error) {
+	// 1. 规范化并校验请求字段，不在错误中回显凭据。
+	input.Email = strings.TrimSpace(input.Email)
+	input.AccessToken = strings.TrimSpace(input.AccessToken)
+	input.RefreshToken = strings.TrimSpace(input.RefreshToken)
+	input.SSOToken = strings.TrimSpace(input.SSOToken)
+	input.ProxyURL = strings.TrimSpace(input.ProxyURL)
+	if err := validateAccountFamilyImportInput(input); err != nil {
+		return AccountFamilyImportItemResult{}, err
+	}
+	normalizedProxy, err := egressapp.NormalizeProxyURL(input.ProxyURL)
+	if err != nil || normalizedProxy == "" {
+		return AccountFamilyImportItemResult{}, &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: "proxy_url 格式无效"}
+	}
+	// 2. 必须唯一匹配 IP 管理中的启用代理，禁止隐式创建或回退到共享出口。
+	candidates := proxyMatches[normalizedProxy]
+	if len(candidates) == 0 {
+		return AccountFamilyImportItemResult{}, &accountFamilyImportFailure{code: AccountFamilyImportProxyNotFound, message: "IP 管理中不存在匹配 proxy_url 的启用代理"}
+	}
+	if len(candidates) > 1 {
+		return AccountFamilyImportItemResult{}, &accountFamilyImportFailure{code: AccountFamilyImportProxyAmbiguous, message: "IP 管理中存在多个相同地址的启用代理"}
+	}
+	// 3. 复用现有 Provider codec 解析三种凭据，再统一加密为领域对象。
+	seeds, err := parseAccountFamilyImportSeeds(input, buildCodec, webCodec, consoleCodec)
+	if err != nil {
+		return AccountFamilyImportItemResult{}, err
+	}
+	values := make([]accountdomain.Credential, 0, len(seeds))
+	for _, seed := range seeds {
+		value, err := s.credentialFromSeed(seed)
+		if err != nil {
+			return AccountFamilyImportItemResult{}, err
+		}
+		values = append(values, value)
+	}
+	// 4. 仓储层在单个事务内完成幂等更新、归组、代理绑定和 Web→Build 关系。
+	stored, err := s.accounts.UpsertAccountFamily(ctx, values, candidates[0].id)
+	if err != nil {
+		if errors.Is(err, repository.ErrConflict) {
+			return AccountFamilyImportItemResult{}, &accountFamilyImportFailure{code: AccountFamilyImportConflict, message: "已有 Provider 凭据分属于不同逻辑账号，无法自动合并"}
+		}
+		return AccountFamilyImportItemResult{}, err
+	}
+	// 5. 按 Provider 生成不含凭据的稳定响应摘要。
+	item := AccountFamilyImportItemResult{
+		Status: AccountFamilyImportCreated, FamilyID: stored.FamilyID, ProxyID: candidates[0].id, ProxyName: candidates[0].name,
+		Accounts: make(map[accountdomain.Provider]AccountFamilyImportAccountResult, len(stored.Accounts)),
+	}
+	allCreated := true
+	for index, accountResult := range stored.Accounts {
+		status := AccountFamilyImportUpdated
+		if accountResult.Created {
+			status = AccountFamilyImportCreated
+		} else {
+			allCreated = false
+		}
+		item.Accounts[values[index].Provider] = AccountFamilyImportAccountResult{ID: accountResult.ID, Status: status}
+	}
+	if !allCreated {
+		item.Status = AccountFamilyImportUpdated
+	}
+	return item, nil
+}
+
+// validateAccountFamilyImportInput 校验一条外部账号的必填字段和安全长度上限。
+// 参数 input 为规范化后的账号输入；返回可安全展示的校验错误。
+func validateAccountFamilyImportInput(input AccountFamilyImportInput) error {
+	address, err := mail.ParseAddress(input.Email)
+	if err != nil || !strings.EqualFold(address.Address, input.Email) || len(input.Email) > 320 {
+		return &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: "email 格式无效"}
+	}
+	fields := []struct {
+		name  string
+		value string
+	}{{"access_token", input.AccessToken}, {"refresh_token", input.RefreshToken}, {"sso_token", input.SSOToken}, {"proxy_url", input.ProxyURL}}
+	for _, field := range fields {
+		if field.value == "" {
+			return &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: field.name + " 不能为空"}
+		}
+		if len(field.value) > maxAccountFamilyImportCredentialBytes {
+			return &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: field.name + " 超过长度限制"}
+		}
+	}
+	return nil
+}
+
+// parseAccountFamilyImportSeeds 使用现有 Provider 解析器把最小输入转换为三个标准凭据种子。
+// 参数 input 为账号输入，三个 codec 分别解析 Build、Web、Console；返回固定顺序的三种凭据种子和校验错误。
+func parseAccountFamilyImportSeeds(input AccountFamilyImportInput, buildCodec, webCodec, consoleCodec provider.CredentialCodecAdapter) ([]provider.CredentialSeed, error) {
+	buildDocument, err := json.Marshal(map[string]any{
+		"provider": "grok_build", "name": input.Email, "email": input.Email,
+		"access_token": input.AccessToken, "refresh_token": input.RefreshToken,
+	})
+	if err != nil {
+		return nil, err
+	}
+	buildSeeds, err := buildCodec.ParseImportedCredentials(buildDocument)
+	if err != nil || len(buildSeeds) != 1 || strings.TrimSpace(buildSeeds[0].UserID) == "" {
+		return nil, &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: "access_token 无法解析稳定账号身份"}
+	}
+	webSeeds, err := webCodec.ParseImportedCredentials([]byte(input.SSOToken))
+	if err != nil || len(webSeeds) != 1 {
+		return nil, &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: "sso_token 无法解析 Grok Web 凭据"}
+	}
+	consoleSeeds, err := consoleCodec.ParseImportedCredentials([]byte(input.SSOToken))
+	if err != nil || len(consoleSeeds) != 1 {
+		return nil, &accountFamilyImportFailure{code: AccountFamilyImportInvalid, message: "sso_token 无法解析 Grok Console 凭据"}
+	}
+	buildSeeds[0].Name = input.Email
+	buildSeeds[0].Email = input.Email
+	webSeeds[0].Name = input.Email
+	consoleSeeds[0].Name = input.Email
+	return []provider.CredentialSeed{buildSeeds[0], webSeeds[0], consoleSeeds[0]}, nil
 }
 
 func (s *Service) importCredentialDocumentsWithProgress(ctx context.Context, adapter provider.CredentialCodecAdapter, documents [][]byte, observer ImportedAccountObserver, progress BatchProgressObserver) (ImportResult, error) {
@@ -2362,6 +2671,27 @@ func normalizePage(page, pageSize int) (int, int) {
 
 func normalizeBatchIDs(ids []uint64) ([]uint64, error) {
 	return normalizeIDs(ids, 500)
+}
+
+// normalizeFamilyIDs 校验并去重手动勾选的逻辑账号组标识，不增加分页之外的数量限制。
+// 参数 ids 为待处理账号组标识；返回保序去重后的标识和参数错误。
+func normalizeFamilyIDs(ids []uint64) ([]uint64, error) {
+	if len(ids) == 0 {
+		return nil, invalidInput("至少选择一个逻辑账号")
+	}
+	seen := make(map[uint64]struct{}, len(ids))
+	result := make([]uint64, 0, len(ids))
+	for _, id := range ids {
+		if id == 0 {
+			return nil, invalidInput("逻辑账号 ID 无效")
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		result = append(result, id)
+	}
+	return result, nil
 }
 
 func normalizeIDs(ids []uint64, limit int) ([]uint64, error) {

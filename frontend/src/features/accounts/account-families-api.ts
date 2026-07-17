@@ -1,5 +1,5 @@
 import { apiRequest, type PaginatedDTO } from "@/shared/api/client";
-import { createPaginatedDecoder, decodeBooleanResult, hasShape, isArrayOf, isBoolean, isOneOf, isOptional, isString } from "@/shared/api/decoder";
+import { createPaginatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 
 import type { AccountProvider } from "@/features/accounts/accounts-api";
 
@@ -26,9 +26,10 @@ type AccountFamilyListInput = {
   page: number;
   pageSize: number;
   search?: string;
+  proxyBinding?: "bound" | "unbound";
 };
 
-type AccountFamilyProxyInput = {
+export type AccountFamilyProxyInput = {
   proxyId?: string;
   clearProxy?: boolean;
 };
@@ -43,14 +44,20 @@ const accountFamilyValidator = hasShape({
 });
 const decodeAccountFamilyPage = createPaginatedDecoder<AccountFamilyDTO>(accountFamilyValidator);
 
-// listAccountFamilies 分页查询逻辑账号组及其三类 Provider 成员。
+// listAccountFamilies 分页查询逻辑账号组；input 包含分页、搜索和绑定筛选；返回分页账号组。
 export function listAccountFamilies(input: AccountFamilyListInput): Promise<PaginatedDTO<AccountFamilyDTO>> {
   const query = new URLSearchParams({ page: String(input.page), pageSize: String(input.pageSize) });
   if (input.search) query.set("search", input.search);
+  if (input.proxyBinding) query.set("proxyBinding", input.proxyBinding);
   return apiRequest(`/api/admin/v1/account-families?${query}`, {}, decodeAccountFamilyPage);
 }
 
-// updateAccountFamilyProxy 绑定、切换或解除一个逻辑账号组的固定代理。
+// updateAccountFamilyProxy 更新单个账号组代理；id 为组标识，input 为绑定或解绑指令；返回是否更新。
 export function updateAccountFamilyProxy(id: string, input: AccountFamilyProxyInput): Promise<{ updated: boolean }> {
   return apiRequest(`/api/admin/v1/account-families/${id}/proxy`, { method: "PATCH", body: input }, decodeBooleanResult<{ updated: boolean }>("updated"));
+}
+
+// batchUpdateAccountFamilyProxy 批量更新勾选账号组代理；ids 为组标识，input 为绑定或解绑指令；返回更新数。
+export function batchUpdateAccountFamilyProxy(ids: string[], input: AccountFamilyProxyInput): Promise<{ updated: number }> {
+  return apiRequest("/api/admin/v1/account-families/batch/proxy", { method: "PATCH", body: { ids, ...input } }, decodeCountResult<{ updated: number }>("updated"));
 }

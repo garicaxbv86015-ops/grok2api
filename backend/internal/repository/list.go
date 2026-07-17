@@ -51,9 +51,18 @@ type AccountListQuery struct {
 	Filter AccountListFilter
 }
 
+// AccountFamilyListFilter 表示逻辑账号组支持的固定过滤条件。
+type AccountFamilyListFilter struct {
+	// ProxyBinding 表示代理绑定状态，可选值为空、bound、unbound。
+	ProxyBinding string
+}
+
 // AccountFamilyListQuery 表示管理端逻辑账号组分页查询。
 type AccountFamilyListQuery struct {
+	// Page 表示分页和模糊搜索条件。
 	Page PageQuery
+	// Filter 表示代理绑定状态等固定过滤条件。
+	Filter AccountFamilyListFilter
 }
 
 // ProxyListFilter 表示代理列表支持的固定过滤条件。

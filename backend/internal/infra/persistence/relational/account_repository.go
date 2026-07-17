@@ -110,18 +110,24 @@ func (r *AccountRepository) ListFamilies(ctx context.Context, input repository.A
 	query := r.db.db.WithContext(ctx).Model(&accountFamilyModel{})
 	if search := strings.TrimSpace(input.Page.Search); search != "" {
 		pattern := "%" + strings.ToLower(search) + "%"
-		query = query.Where(`EXISTS (
+		query = query.Joins("LEFT JOIN proxies AS search_proxy ON search_proxy.id = account_families.proxy_id").Where(`LOWER(search_proxy.name) LIKE ? OR EXISTS (
 			SELECT 1 FROM provider_accounts member
 			WHERE member.family_id = account_families.id
 			AND (LOWER(member.name) LIKE ? OR LOWER(member.email) LIKE ? OR LOWER(member.user_id) LIKE ? OR LOWER(member.team_id) LIKE ?)
-		)`, pattern, pattern, pattern, pattern)
+		)`, pattern, pattern, pattern, pattern, pattern)
+	}
+	switch input.Filter.ProxyBinding {
+	case "bound":
+		query = query.Where("account_families.proxy_id IS NOT NULL")
+	case "unbound":
+		query = query.Where("account_families.proxy_id IS NULL")
 	}
 	var total int64
 	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var rows []accountFamilyModel
-	if err := query.Preload("Proxy").Order("created_at DESC, id DESC").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+	if err := query.Preload("Proxy").Order("account_families.created_at DESC, account_families.id DESC").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	values := make([]account.Family, 0, len(rows))
@@ -573,17 +579,41 @@ func (r *AccountRepository) SetFamilyProxy(ctx context.Context, familyID uint64,
 	if familyID == 0 {
 		return repository.ErrNotFound
 	}
-	result := r.db.db.WithContext(ctx).Model(&accountFamilyModel{}).Where("id = ?", familyID).Updates(map[string]any{
-		"proxy_id": proxyID,
-		"updated_at": time.Now().UTC(),
+	_, err := r.SetFamilyProxies(ctx, []uint64{familyID}, proxyID)
+	return err
+}
+
+// SetFamilyProxies 在单次事务内更新多个逻辑账号组的固定代理绑定。
+// 参数 ctx 为请求上下文，familyIDs 为逻辑账号组标识，proxyID 为目标代理标识或 nil；返回更新数量和持久化错误。
+func (r *AccountRepository) SetFamilyProxies(ctx context.Context, familyIDs []uint64, proxyID *uint64) (int64, error) {
+	if len(familyIDs) == 0 {
+		return 0, repository.ErrNotFound
+	}
+	var updated int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 1. 先锁定本次操作的完整目标集合，目标缺失时不允许产生部分更新。
+		var found int64
+		if err := tx.Model(&accountFamilyModel{}).Where("id IN ?", familyIDs).Count(&found).Error; err != nil {
+			return err
+		}
+		if found != int64(len(familyIDs)) {
+			return repository.ErrNotFound
+		}
+		// 2. 在同一事务中统一写入代理和更新时间。
+		result := tx.Model(&accountFamilyModel{}).Where("id IN ?", familyIDs).Updates(map[string]any{
+			"proxy_id": proxyID,
+			"updated_at": time.Now().UTC(),
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		updated = found
+		return nil
 	})
-	if result.Error != nil {
-		return mapError(result.Error)
+	if err != nil {
+		return 0, mapError(err)
 	}
-	if result.RowsAffected == 0 {
-		return repository.ErrNotFound
-	}
-	return nil
+	return updated, nil
 }
 
 func (r *AccountRepository) UpsertByIdentity(ctx context.Context, value account.Credential) (account.Credential, bool, error) {
@@ -638,6 +668,138 @@ func (r *AccountRepository) UpsertManyByIdentity(ctx context.Context, values []a
 		return nil, mapError(err)
 	}
 	return results, nil
+}
+
+// UpsertAccountFamily 在单个事务中写入同组 Provider 凭据、代理绑定和 Web→Build 关系。
+// 参数 ctx 为请求上下文，values 为同一身份的 Provider 凭据，proxyID 为已维护代理标识；返回账号组及各账号写入结果。
+func (r *AccountRepository) UpsertAccountFamily(ctx context.Context, values []account.Credential, proxyID uint64) (repository.AccountFamilyUpsertResult, error) {
+	if len(values) == 0 || proxyID == 0 {
+		return repository.AccountFamilyUpsertResult{}, repository.ErrNotFound
+	}
+	result := repository.AccountFamilyUpsertResult{Accounts: make([]repository.AccountUpsertResult, len(values))}
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 1. 读取已有身份，并记录由 Build sub 生成的稳定身份键。
+		identityKeys := make([]string, 0, len(values))
+		incomingProviders := make(map[account.Provider]struct{}, len(values))
+		var buildIdentityKey string
+		for _, value := range values {
+			if _, exists := incomingProviders[value.Provider]; exists {
+				return repository.ErrConflict
+			}
+			incomingProviders[value.Provider] = struct{}{}
+			identityKey := fromAccountDomain(value).IdentityKey
+			identityKeys = append(identityKeys, identityKey)
+			if value.Provider == account.ProviderBuild {
+				buildIdentityKey = identityKey
+			}
+		}
+		if buildIdentityKey == "" {
+			return repository.ErrConflict
+		}
+		var existingRows []accountModel
+		if err := tx.Where("identity_key IN ?", identityKeys).Find(&existingRows).Error; err != nil {
+			return err
+		}
+		existingByIdentity := make(map[string]accountModel, len(existingRows))
+		for _, row := range existingRows {
+			existingByIdentity[row.IdentityKey] = row
+		}
+		// 2. 仅允许 Build 的稳定身份决定逻辑账号组，避免 Web/Console SSO 身份导致串号。
+		var familyID uint64
+		if buildRow, exists := existingByIdentity[buildIdentityKey]; exists && buildRow.FamilyID != nil {
+			familyID = *buildRow.FamilyID
+		}
+		for _, row := range existingRows {
+			if row.FamilyID == nil || *row.FamilyID == 0 {
+				continue
+			}
+			if familyID == 0 || familyID != *row.FamilyID {
+				return repository.ErrConflict
+			}
+		}
+		// 3. Build 首次导入时创建账号组；重复导入则复用它原来的账号组。
+		now := time.Now().UTC()
+		if familyID == 0 {
+			family := accountFamilyModel{ProxyID: &proxyID, CreatedAt: now, UpdatedAt: now}
+			if err := tx.Create(&family).Error; err != nil {
+				return err
+			}
+			familyID = family.ID
+		} else {
+			if err := tx.Model(&accountFamilyModel{}).Where("id = ?", familyID).Updates(map[string]any{"proxy_id": proxyID, "updated_at": now}).Error; err != nil {
+				return err
+			}
+		}
+		result.FamilyID = familyID
+
+		// 4. 重复导入时按 Provider 找到组内原成员，允许 SSO token 轮换后更新原 Web/Console 账号。
+		var familyRows []accountModel
+		if err := tx.Where("family_id = ?", familyID).Find(&familyRows).Error; err != nil {
+			return err
+		}
+		existingByProvider := make(map[account.Provider]accountModel, len(familyRows))
+		for _, row := range familyRows {
+			providerValue := account.Provider(row.Provider)
+			if _, exists := incomingProviders[providerValue]; !exists {
+				continue
+			}
+			if _, exists := existingByProvider[providerValue]; exists {
+				return repository.ErrConflict
+			}
+			existingByProvider[providerValue] = row
+		}
+
+		// 5. 三种凭据在同一事务中统一写入相同 family_id。
+		providerIDs := make(map[account.Provider]uint64, len(values))
+		for index, value := range values {
+			value.FamilyID = familyID
+			identityKey := fromAccountDomain(value).IdentityKey
+			existing, found := existingByIdentity[identityKey]
+			providerExisting, providerFound := existingByProvider[value.Provider]
+			if found && providerFound && existing.ID != providerExisting.ID {
+				return repository.ErrConflict
+			}
+			if !found {
+				existing, found = providerExisting, providerFound
+			}
+			var current *accountModel
+			if found {
+				copy := existing
+				current = &copy
+			}
+			accountResult, stored, err := upsertKnownAccountByIdentity(tx, value, current)
+			if err != nil {
+				return err
+			}
+			result.Accounts[index] = accountResult
+			providerIDs[value.Provider] = stored.ID
+			existingByIdentity[stored.IdentityKey] = stored
+			existingByProvider[value.Provider] = stored
+		}
+
+		// 6. Web 与 Build 需要保留现有一对一关系，Console 仅通过 family_id 归组。
+		webID, hasWeb := providerIDs[account.ProviderWeb]
+		buildID, hasBuild := providerIDs[account.ProviderBuild]
+		if !hasWeb || !hasBuild {
+			return repository.ErrConflict
+		}
+		var link accountProviderLinkModel
+		linkErr := tx.Where("web_account_id = ? OR build_account_id = ?", webID, buildID).First(&link).Error
+		switch {
+		case linkErr == nil && link.WebAccountID == webID && link.BuildAccountID == buildID:
+			return nil
+		case linkErr == nil:
+			return repository.ErrConflict
+		case !errors.Is(linkErr, gorm.ErrRecordNotFound):
+			return linkErr
+		default:
+			return tx.Create(&accountProviderLinkModel{WebAccountID: webID, BuildAccountID: buildID, CreatedAt: now}).Error
+		}
+	})
+	if err != nil {
+		return repository.AccountFamilyUpsertResult{}, mapError(err)
+	}
+	return result, nil
 }
 
 func upsertAccountByIdentity(tx *gorm.DB, value account.Credential) (repository.AccountUpsertResult, error) {
