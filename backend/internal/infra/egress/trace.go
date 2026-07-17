@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	domain "github.com/chenyme/grok2api/backend/internal/domain/egress"
 )
 
@@ -27,6 +28,7 @@ type Trace struct {
 
 type traceContextKey struct{}
 type accountContextKey struct{}
+type credentialContextKey struct{}
 
 // WithAccount 将稳定的 Provider 账号身份传递到出口层。该值只用于渲染
 // Resin 等粘性代理的认证用户名，不会写入上游 Header 或审计。
@@ -35,6 +37,31 @@ func WithAccount(ctx context.Context, provider string, accountID uint64) context
 		return ctx
 	}
 	return WithAccountIdentity(ctx, strings.TrimSpace(provider)+"_"+fmt.Sprintf("%d", accountID))
+}
+
+// WithCredential 将完整账号出口配置传递给 Build HTTP Transport。
+// 参数 ctx 为请求上下文，credential 为账号凭据；返回携带非公开出口配置和稳定账号身份的上下文。
+func WithCredential(ctx context.Context, credential accountdomain.Credential) context.Context {
+	if ctx == nil || credential.ID == 0 {
+		return ctx
+	}
+	ctx = context.WithValue(ctx, credentialContextKey{}, credential)
+	provider := credential.Provider
+	if provider == "" {
+		// CLI 单元测试及部分刷新路径只携带账号 ID；该上下文入口由 Build Transport 使用。
+		provider = accountdomain.ProviderBuild
+	}
+	return WithAccount(ctx, string(provider), credential.ID)
+}
+
+// CredentialFromContext 返回 Build HTTP Transport 所需的账号出口配置。
+// 参数 ctx 为请求上下文；返回账号凭据和是否存在。
+func CredentialFromContext(ctx context.Context) (accountdomain.Credential, bool) {
+	if ctx == nil {
+		return accountdomain.Credential{}, false
+	}
+	value, ok := ctx.Value(credentialContextKey{}).(accountdomain.Credential)
+	return value, ok
 }
 
 // WithAccountIdentity attaches the stable, non-sensitive identity used by

@@ -116,6 +116,8 @@ type UpdateInput struct {
 	MinimumRemaining       *float64
 	CloudflareCookies      *string
 	ClearCloudflareCookies bool
+	ProxyID                *uint64
+	ClearProxy             bool
 }
 
 type DeviceStartResult struct {
@@ -227,6 +229,7 @@ func (s *Service) Summary(ctx context.Context) (Summary, error) {
 // Service 负责 OAuth 账号接入、刷新、额度和持久化生命周期。
 type Service struct {
 	accounts              repository.AccountRepository
+	proxies               repository.ProxyRepository
 	audits                repository.AuditRepository
 	deviceSessions        repository.DeviceSessionRepository
 	sticky                repository.StickySessionRepository
@@ -252,6 +255,12 @@ type Service struct {
 
 func (s *Service) SetQuotaRecoveryQueue(queue repository.QuotaRecoveryQueue) {
 	s.quotaQueue = queue
+}
+
+// SetProxyRepository 注入逻辑账号组绑定代理时使用的通用代理仓储。
+// 参数 proxies 为通用代理仓储；无返回值。
+func (s *Service) SetProxyRepository(proxies repository.ProxyRepository) {
+	s.proxies = proxies
 }
 
 func NewService(accounts repository.AccountRepository, audits repository.AuditRepository, deviceSessions repository.DeviceSessionRepository, sticky repository.StickySessionRepository, providers *provider.Registry, cipher *security.Cipher, refreshLock repository.DistributedLock) *Service {
@@ -351,6 +360,36 @@ func (s *Service) List(ctx context.Context, page, pageSize int, search string, f
 		views = append(views, view)
 	}
 	return views, total, nil
+}
+
+// ListFamilies 分页返回逻辑账号组及其 Web、Build、Console 成员摘要。
+// 参数 ctx 为请求上下文，page 为页码，pageSize 为每页数量，search 为成员搜索词；返回账号组、总数和错误。
+func (s *Service) ListFamilies(ctx context.Context, page, pageSize int, search string) ([]accountdomain.Family, int64, error) {
+	page, pageSize = normalizePage(page, pageSize)
+	return s.accounts.ListFamilies(ctx, repository.AccountFamilyListQuery{
+		Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Search: search},
+	})
+}
+
+// UpdateFamilyProxy 更新整个逻辑账号组的固定代理绑定。
+// 参数 ctx 为请求上下文，familyID 为逻辑账号组标识，proxyID 为目标代理，clear 表示解绑；返回校验或持久化错误。
+func (s *Service) UpdateFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64, clear bool) error {
+	if familyID == 0 {
+		return ErrNotFound
+	}
+	if proxyID != nil && clear {
+		return invalidInput("proxyId 与 clearProxy 不能同时设置")
+	}
+	if proxyID == nil && !clear {
+		return invalidInput("必须选择代理或解除绑定")
+	}
+	if err := s.validateProxyBinding(ctx, proxyID); err != nil {
+		return err
+	}
+	if clear {
+		proxyID = nil
+	}
+	return mapRepositoryError(s.accounts.SetFamilyProxy(ctx, familyID, proxyID))
 }
 
 func oneOf(value string, allowed ...string) bool {
@@ -862,6 +901,7 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 			return ImportResult{}, fmt.Errorf("生成 Grok Console SSO 凭据: 预期 1 个账号，实际 %d 个", len(parsed))
 		}
 		seed := parsed[0]
+		seed.FamilyID = value.FamilyID
 		seed.Provider = accountdomain.ProviderConsole
 		seed.AuthType = accountdomain.AuthTypeSSO
 		seed.Name = webConsoleAccountName(value.Name, seed.Name)
@@ -1160,6 +1200,7 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	}
 	seed.Provider = accountdomain.ProviderBuild
 	seed.AuthType = accountdomain.AuthTypeOAuth
+	seed.FamilyID = value.FamilyID
 	if linkedBuildSourceKey != "" {
 		seed.SourceKey = linkedBuildSourceKey
 	}
@@ -1270,6 +1311,12 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 			value.EncryptedCloudflareCookie = encrypted
 		}
 	}
+	if input.ProxyID != nil && input.ClearProxy {
+		return View{}, invalidInput("proxyId 与 clearProxy 不能同时设置")
+	}
+	if err := s.validateProxyBinding(ctx, input.ProxyID); err != nil {
+		return View{}, err
+	}
 	updated, err := s.accounts.Update(ctx, value)
 	if err != nil {
 		return View{}, mapRepositoryError(err)
@@ -1279,7 +1326,38 @@ func (s *Service) Update(ctx context.Context, id uint64, input UpdateInput) (Vie
 	} else if updated.Enabled && s.providers != nil && s.providers.SupportsCredentialRefresh(updated.Provider) {
 		s.WakeCredentialRefresh()
 	}
+	if input.ProxyID != nil {
+		if err := s.accounts.SetFamilyProxy(ctx, updated.FamilyID, input.ProxyID); err != nil {
+			return View{}, mapRepositoryError(err)
+		}
+	} else if input.ClearProxy {
+		if err := s.accounts.SetFamilyProxy(ctx, updated.FamilyID, nil); err != nil {
+			return View{}, mapRepositoryError(err)
+		}
+	}
 	return s.Get(ctx, updated.ID)
+}
+
+// validateProxyBinding 校验可空代理标识是否指向一个已启用代理。
+// 参数 ctx 为请求上下文，proxyID 为待绑定代理标识，nil 表示无需校验；返回安全的业务错误或仓储错误。
+func (s *Service) validateProxyBinding(ctx context.Context, proxyID *uint64) error {
+	if proxyID == nil {
+		return nil
+	}
+	if *proxyID == 0 || s.proxies == nil {
+		return invalidInput("代理不存在")
+	}
+	boundProxy, err := s.proxies.Get(ctx, *proxyID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return invalidInput("代理不存在")
+	}
+	if err != nil {
+		return err
+	}
+	if !boundProxy.Enabled {
+		return invalidInput("不能绑定已停用代理")
+	}
+	return nil
 }
 
 // MarkBuildAPIFallback 幂等写入 Build 账号 XAI 推理回退标记；失败不吞掉，调用方可重试。
@@ -2265,7 +2343,7 @@ func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomai
 		}
 		authType = definition.Credential.AuthType
 	}
-	value := accountdomain.Credential{Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
+	value := accountdomain.Credential{FamilyID: seed.FamilyID, Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
 	return value, nil
 }
 

@@ -18,6 +18,12 @@ type AccountRepository struct{ db *Database }
 
 func NewAccountRepository(db *Database) *AccountRepository { return &AccountRepository{db: db} }
 
+// preloadAccountRelations 统一加载账号凭据、Web 配置和逻辑账号组代理。
+// 参数 query 为账号查询；返回附加完整关联预加载的查询对象。
+func preloadAccountRelations(query *gorm.DB) *gorm.DB {
+	return query.Preload("Credential").Preload("WebProfile").Preload("Family.Proxy")
+}
+
 type quotaBreakdownJSON struct {
 	ProductCode  int     `json:"productCode"`
 	UsagePercent float64 `json:"usagePercent"`
@@ -85,7 +91,7 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		"status":    {expression: accountStatusSortExpression},
 		"createdAt": {expression: "provider_accounts.created_at", defaultDirection: repository.SortDescending},
 	}, sortSpec{expression: "provider_accounts.created_at", defaultDirection: repository.SortDescending}, "provider_accounts.id")
-	if err := query.Preload("Credential").Preload("WebProfile").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+	if err := preloadAccountRelations(query).Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
 	}
 	out := make([]account.Credential, 0, len(rows))
@@ -96,6 +102,62 @@ func (r *AccountRepository) List(ctx context.Context, input repository.AccountLi
 		return nil, 0, err
 	}
 	return out, total, nil
+}
+
+// ListFamilies 分页读取逻辑账号组、绑定代理和组内 Provider 凭据摘要。
+// 参数 ctx 为请求上下文，input 为分页及搜索条件；返回账号组列表、总数和错误。
+func (r *AccountRepository) ListFamilies(ctx context.Context, input repository.AccountFamilyListQuery) ([]account.Family, int64, error) {
+	query := r.db.db.WithContext(ctx).Model(&accountFamilyModel{})
+	if search := strings.TrimSpace(input.Page.Search); search != "" {
+		pattern := "%" + strings.ToLower(search) + "%"
+		query = query.Where(`EXISTS (
+			SELECT 1 FROM provider_accounts member
+			WHERE member.family_id = account_families.id
+			AND (LOWER(member.name) LIKE ? OR LOWER(member.email) LIKE ? OR LOWER(member.user_id) LIKE ? OR LOWER(member.team_id) LIKE ?)
+		)`, pattern, pattern, pattern, pattern)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var rows []accountFamilyModel
+	if err := query.Preload("Proxy").Order("created_at DESC, id DESC").Offset(input.Page.Offset).Limit(input.Page.Limit).Find(&rows).Error; err != nil {
+		return nil, 0, err
+	}
+	values := make([]account.Family, 0, len(rows))
+	familiesByID := make(map[uint64]int, len(rows))
+	familyIDs := make([]uint64, 0, len(rows))
+	for _, row := range rows {
+		value := account.Family{ID: row.ID, ProxyID: row.ProxyID, Members: []account.FamilyMember{}, CreatedAt: row.CreatedAt.UTC(), UpdatedAt: row.UpdatedAt.UTC()}
+		if row.Proxy != nil {
+			value.ProxyName = row.Proxy.Name
+			value.ProxyEnabled = row.Proxy.Enabled
+		}
+		familiesByID[row.ID] = len(values)
+		familyIDs = append(familyIDs, row.ID)
+		values = append(values, value)
+	}
+	if len(familyIDs) == 0 {
+		return values, total, nil
+	}
+	var members []accountModel
+	if err := r.db.db.WithContext(ctx).Where("family_id IN ?", familyIDs).Order("family_id ASC, CASE provider WHEN 'grok_web' THEN 0 WHEN 'grok_build' THEN 1 ELSE 2 END, id ASC").Find(&members).Error; err != nil {
+		return nil, 0, err
+	}
+	for _, member := range members {
+		if member.FamilyID == nil {
+			continue
+		}
+		index, exists := familiesByID[*member.FamilyID]
+		if !exists {
+			continue
+		}
+		values[index].Members = append(values[index].Members, account.FamilyMember{
+			ID: member.ID, Provider: account.Provider(member.Provider), Name: member.Name, Email: member.Email,
+			Enabled: member.Enabled, AuthStatus: account.AuthStatus(member.AuthStatus),
+		})
+	}
+	return values, total, nil
 }
 
 func (r *AccountRepository) ListProviderAccountBatch(ctx context.Context, providerValue account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error) {
@@ -109,8 +171,7 @@ func (r *AccountRepository) ListProviderAccountBatch(ctx context.Context, provid
 		}
 	}
 	var rows []accountModel
-	if err := r.db.db.WithContext(ctx).
-		Preload("Credential").Preload("WebProfile").
+	if err := preloadAccountRelations(r.db.db.WithContext(ctx)).
 		Where("provider = ? AND id > ?", providerValue, afterID).
 		Order("id ASC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, 0, err
@@ -274,7 +335,7 @@ func (r *AccountRepository) ListRoutingCandidates(ctx context.Context, provider 
 
 func (r *AccountRepository) ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error) {
 	var rows []accountModel
-	err := r.db.db.WithContext(ctx).Preload("Credential").Preload("WebProfile").Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Order("priority DESC, id ASC").Find(&rows).Error
+	err := preloadAccountRelations(r.db.db.WithContext(ctx)).Where("provider = ? AND enabled = ? AND auth_status = ?", provider, true, account.AuthStatusActive).Order("priority DESC, id ASC").Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
@@ -361,8 +422,7 @@ func (r *AccountRepository) ListMissingConsoleSyncAccounts(ctx context.Context, 
 		return nil, repository.ErrNotFound
 	}
 	var rows []accountModel
-	if err := r.db.db.WithContext(ctx).
-		Preload("Credential").Preload("WebProfile").
+	if err := preloadAccountRelations(r.db.db.WithContext(ctx)).
 		Where("id IN ? AND provider = ?", ids, account.ProviderWeb).
 		Where(missingConsoleAccountPredicate, account.ProviderConsole).
 		Order("id ASC").Find(&rows).Error; err != nil {
@@ -396,7 +456,7 @@ func (r *AccountRepository) ListMissingConsoleSyncBatch(ctx context.Context, aft
 		skipped = max(0, all-total)
 	}
 	var rows []accountModel
-	if err := query().Preload("Credential").Preload("WebProfile").
+	if err := preloadAccountRelations(query()).
 		Where("id > ?", afterID).Order("id ASC").Limit(limit).Find(&rows).Error; err != nil {
 		return nil, 0, 0, err
 	}
@@ -418,7 +478,7 @@ func (r *AccountRepository) HasActive(ctx context.Context, provider account.Prov
 
 func (r *AccountRepository) Get(ctx context.Context, id uint64) (account.Credential, error) {
 	var row accountModel
-	if err := r.db.db.WithContext(ctx).Preload("Credential").Preload("WebProfile").First(&row, id).Error; err != nil {
+	if err := preloadAccountRelations(r.db.db.WithContext(ctx)).First(&row, id).Error; err != nil {
 		return account.Credential{}, mapError(err)
 	}
 	value := toAccountDomain(row)
@@ -435,14 +495,21 @@ func (r *AccountRepository) LinkWebToBuild(ctx context.Context, webAccountID, bu
 	}
 	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var webAccount, buildAccount accountModel
-		if err := tx.Select("id", "provider").First(&webAccount, webAccountID).Error; err != nil {
+		if err := tx.Select("id", "provider", "family_id").First(&webAccount, webAccountID).Error; err != nil {
 			return err
 		}
-		if err := tx.Select("id", "provider").First(&buildAccount, buildAccountID).Error; err != nil {
+		if err := tx.Select("id", "provider", "family_id").First(&buildAccount, buildAccountID).Error; err != nil {
 			return err
 		}
 		if webAccount.Provider != string(account.ProviderWeb) || buildAccount.Provider != string(account.ProviderBuild) {
 			return repository.ErrConflict
+		}
+		if webAccount.FamilyID == nil || *webAccount.FamilyID == 0 {
+			return repository.ErrConflict
+		}
+		// Web→Build 关系创建前先统一逻辑账号组，确保两个 Provider 始终共用固定代理。
+		if err := tx.Model(&accountModel{}).Where("id = ?", buildAccountID).Update("family_id", *webAccount.FamilyID).Error; err != nil {
+			return err
 		}
 		var existing accountProviderLinkModel
 		err := tx.Where("web_account_id = ? OR build_account_id = ?", webAccountID, buildAccountID).First(&existing).Error
@@ -496,6 +563,25 @@ func (r *AccountRepository) attachAccountLinks(ctx context.Context, values []acc
 			values[index].LinkedAccountName = row.WebName
 			values[index].LinkedProvider = account.ProviderWeb
 		}
+	}
+	return nil
+}
+
+// SetFamilyProxy 更新逻辑账号组的固定代理绑定。
+// 参数 ctx 为请求上下文，familyID 为逻辑账号组标识，proxyID 为目标代理标识或 nil；返回持久化错误。
+func (r *AccountRepository) SetFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64) error {
+	if familyID == 0 {
+		return repository.ErrNotFound
+	}
+	result := r.db.db.WithContext(ctx).Model(&accountFamilyModel{}).Where("id = ?", familyID).Updates(map[string]any{
+		"proxy_id": proxyID,
+		"updated_at": time.Now().UTC(),
+	})
+	if result.Error != nil {
+		return mapError(result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return repository.ErrNotFound
 	}
 	return nil
 }
@@ -580,6 +666,9 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 			value.EncryptedCloudflareCookie = storedCredential.EncryptedCloudflareCookie
 		}
 		row.ID = existing.ID
+		if row.FamilyID == nil {
+			row.FamilyID = existing.FamilyID
+		}
 		row.CreatedAt = existing.CreatedAt
 		row.Enabled = existing.Enabled
 		row.Priority = existing.Priority
@@ -611,6 +700,13 @@ func upsertKnownAccountByIdentity(tx *gorm.DB, value account.Credential, existin
 		row.MaxConcurrent = account.DefaultMaxConcurrent
 	}
 	row.Enabled = true
+	if row.FamilyID == nil {
+		family := accountFamilyModel{CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+		if err := tx.Create(&family).Error; err != nil {
+			return repository.AccountUpsertResult{}, accountModel{}, err
+		}
+		row.FamilyID = &family.ID
+	}
 	if err := tx.Create(&row).Error; err != nil {
 		return repository.AccountUpsertResult{}, accountModel{}, err
 	}
@@ -670,11 +766,11 @@ func (r *AccountRepository) UpdateMany(ctx context.Context, ids []uint64, update
 }
 
 func (r *AccountRepository) Delete(ctx context.Context, id uint64) error {
-	result := r.db.db.WithContext(ctx).Delete(&accountModel{}, id)
-	if result.Error != nil {
-		return mapError(result.Error)
+	deleted, err := r.deleteAccounts(ctx, []uint64{id})
+	if err != nil {
+		return err
 	}
-	if result.RowsAffected == 0 {
+	if deleted == 0 {
 		return repository.ErrNotFound
 	}
 	return nil
@@ -684,8 +780,38 @@ func (r *AccountRepository) DeleteMany(ctx context.Context, ids []uint64) (int64
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	result := r.db.db.WithContext(ctx).Where("id IN ?", ids).Delete(&accountModel{})
-	return result.RowsAffected, result.Error
+	return r.deleteAccounts(ctx, ids)
+}
+
+// deleteAccounts 删除账号并回收已不含任何 Provider 凭据的空逻辑账号组。
+// 参数 ctx 为请求上下文，ids 为账号标识；返回删除数量和错误。
+func (r *AccountRepository) deleteAccounts(ctx context.Context, ids []uint64) (int64, error) {
+	var deleted int64
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var familyIDs []uint64
+		if err := tx.Model(&accountModel{}).Where("id IN ? AND family_id IS NOT NULL", ids).Pluck("family_id", &familyIDs).Error; err != nil {
+			return err
+		}
+		result := tx.Where("id IN ?", ids).Delete(&accountModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		deleted = result.RowsAffected
+		// 账号组仍包含 Web、Build 或 Console 任一凭据时必须保留其代理绑定。
+		for _, familyID := range familyIDs {
+			var remaining int64
+			if err := tx.Model(&accountModel{}).Where("family_id = ?", familyID).Count(&remaining).Error; err != nil {
+				return err
+			}
+			if remaining == 0 {
+				if err := tx.Delete(&accountFamilyModel{}, familyID).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	return deleted, mapError(err)
 }
 
 func (r *AccountRepository) UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error) {

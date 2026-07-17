@@ -15,6 +15,15 @@ type egressTransport struct {
 }
 
 func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if credential, exists := infraegress.CredentialFromContext(request.Context()); exists {
+		lease, bound, err := t.manager.AcquireBoundCredential(request.Context(), domainegress.ScopeBuild, credential)
+		if err != nil {
+			return nil, err
+		}
+		if bound {
+			return t.roundTripLease(request, lease)
+		}
+	}
 	affinity := infraegress.AccountFromContext(request.Context())
 	if affinity == "" {
 		affinity = "bootstrap"
@@ -26,6 +35,12 @@ func (t *egressTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	if !configured {
 		return t.fallback.RoundTrip(request)
 	}
+	return t.roundTripLease(request, lease)
+}
+
+// roundTripLease 使用已选择的出口租约执行 Build 请求并正确释放连接计数。
+// 参数 request 为上游请求，lease 为出口租约；返回上游响应或传输错误。
+func (t *egressTransport) roundTripLease(request *http.Request, lease *infraegress.Lease) (*http.Response, error) {
 	if lease.UserAgent != "" {
 		request.Header.Set("User-Agent", lease.UserAgent)
 	}

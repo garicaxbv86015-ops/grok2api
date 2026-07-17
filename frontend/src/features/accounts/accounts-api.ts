@@ -61,6 +61,10 @@ export type QuotaDTO = {
 
 export type AccountDTO = {
   id: string;
+  familyId: string;
+  proxyId?: string;
+  proxyName?: string;
+  proxyEnabled: boolean;
   provider: AccountProvider;
   authType: "oauth" | "sso";
   webTier?: "auto" | "basic" | "super" | "heavy";
@@ -102,6 +106,8 @@ export type AccountUpdateInput = {
   minimumRemaining: number;
   cloudflareCookies?: string;
   clearCloudflareCookies?: boolean;
+  proxyId?: string;
+  clearProxy?: boolean;
 };
 
 export type AccountSummaryDTO = {
@@ -155,7 +161,8 @@ const quotaWindowValidator = hasShape({
   windowSeconds: isNumber, resetAt: isOptional(isString), syncedAt: isOptional(isString), source: isOneOf("default", "estimated", "upstream"),
 });
 const accountValidator = hasShape({
-  id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
+  id: isString, familyId: isString, proxyId: isOptional(isString), proxyName: isOptional(isString), proxyEnabled: isBoolean,
+  provider: isOneOf("grok_build", "grok_web", "grok_console"), authType: isOneOf("oauth", "sso"), webTier: isOptional(isOneOf("auto", "basic", "super", "heavy")),
   webTierSyncedAt: isOptional(isString), name: isString, email: isOptional(isString), userId: isOptional(isString), teamId: isOptional(isString),
   enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"), expiresAt: isOptional(isString), refreshable: isBoolean, cloudflareCookieConfigured: isBoolean,
   refreshDueAt: isOptional(isString), lastRefreshAt: isOptional(isString), refreshFailureCount: isNumber,

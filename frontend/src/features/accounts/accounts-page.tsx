@@ -16,6 +16,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
@@ -66,6 +67,8 @@ import {
   type QuotaDTO,
 } from "@/features/accounts/accounts-api";
 import { AccountQuota, ConsoleQuota, WebQuota } from "@/features/accounts/account-quota";
+import { AccountFamiliesPanel } from "@/features/accounts/account-families-panel";
+import { listProxyOptions } from "@/features/proxies/proxies-api";
 
 function isAbortError(error: unknown): boolean {
   return (error instanceof DOMException || error instanceof Error) && error.name === "AbortError";
@@ -87,6 +90,7 @@ export function AccountsPage() {
   const importAbortRef = useRef<AbortController | null>(null);
   const importToastRef = useRef<string | number | null>(null);
   const [provider, setProvider] = useState<AccountProvider>("grok_build");
+  const [logicalMode, setLogicalMode] = useState(false);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [search, setSearch] = useState("");
@@ -133,6 +137,7 @@ export function AccountsPage() {
     minimumRemaining: z.number().min(0),
     cloudflareCookies: z.string().max(16 << 10, t("settings.invalidValue")),
     clearCloudflareCookies: z.boolean(),
+    proxyId: z.string(),
   });
   type AccountForm = z.infer<typeof accountSchema>;
   const form = useForm<AccountForm>({
@@ -140,19 +145,28 @@ export function AccountsPage() {
     defaultValues: {
       name: "", enabled: true, priority: 1, maxConcurrent: 8, minimumRemaining: 0,
       cloudflareCookies: "", clearCloudflareCookies: false,
+      proxyId: "none",
     },
   });
   const accountEnabled = useWatch({ control: form.control, name: "enabled" });
   const clearCloudflareCookies = useWatch({ control: form.control, name: "clearCloudflareCookies" });
+  const accountProxyID = useWatch({ control: form.control, name: "proxyId" });
 
   const accountsQuery = useQuery({
     queryKey: ["accounts", provider, page, pageSize, debouncedSearch, typeFilter, statusFilter, renewalFilter, sort.field, sort.order],
     queryFn: () => listAccounts({ provider, page, pageSize, search: debouncedSearch, type: typeFilter, status: statusFilter, renewal: provider === "grok_build" ? renewalFilter : undefined, sortBy: sort.field, sortOrder: sort.order }),
+    enabled: !logicalMode,
   });
 
   const summaryQuery = useQuery({
     queryKey: ["accounts", "summary"],
     queryFn: getAccountSummary,
+  });
+
+  const proxyOptionsQuery = useQuery({
+    queryKey: ["proxies", "options"],
+    queryFn: listProxyOptions,
+    enabled: Boolean(editing),
   });
 
   const invalidateAccountData = useCallback(() => {
@@ -173,6 +187,11 @@ export function AccountsPage() {
       if (editing.provider !== "grok_build") {
         if (values.clearCloudflareCookies) input.clearCloudflareCookies = true;
         else if (values.cloudflareCookies.trim()) input.cloudflareCookies = values.cloudflareCookies;
+      }
+      if (values.proxyId === "none") {
+        if (editing.proxyId) input.clearProxy = true;
+      } else if (values.proxyId !== editing.proxyId) {
+        input.proxyId = values.proxyId;
       }
       return updateAccount(editing.id, input);
     },
@@ -417,7 +436,9 @@ export function AccountsPage() {
     };
   }, [deviceOpen, deviceSession, deviceStatus, invalidateAccountData, t]);
 
+  // changeProvider 切换 Provider 账号视图，并退出逻辑账号模式。
   function changeProvider(value: AccountProvider) {
+    setLogicalMode(false);
     setProvider(value);
     setPage(1);
     setSelected(new Set());
@@ -469,6 +490,7 @@ export function AccountsPage() {
       minimumRemaining: account.minimumRemaining,
       cloudflareCookies: "",
       clearCloudflareCookies: false,
+      proxyId: account.proxyId ?? "none",
     });
   }
 
@@ -545,13 +567,15 @@ export function AccountsPage() {
         <AccountMetricPanel icon={<TriangleAlert />} loading={summaryLoading} label={t("accounts.abnormalAccountCount")} value={summaryUnavailable ? "-" : formatNumber(abnormalAccounts, i18n.language, 0)} detail={t("accounts.abnormalAccountBreakdown", { recovering: formatNumber(recoveringAccounts, i18n.language, 0), attention: formatNumber(attentionAccounts, i18n.language, 0) })} />
       </section>
       <div className="space-y-6">
-        <Tabs value={provider} onValueChange={(value) => changeProvider(value as AccountProvider)}>
+        <Tabs value={logicalMode ? "logical" : provider} onValueChange={(value) => { if (value === "logical") { setLogicalMode(true); setSelected(new Set()); } else changeProvider(value as AccountProvider); }}>
           <TabsList>
             <TabsTrigger value="grok_build">Grok Build</TabsTrigger>
             <TabsTrigger value="grok_web">Grok Web</TabsTrigger>
             <TabsTrigger value="grok_console">Grok Console</TabsTrigger>
+            <TabsTrigger value="logical">{t("accountFamilies.tab")}</TabsTrigger>
           </TabsList>
         </Tabs>
+        {logicalMode ? <AccountFamiliesPanel /> : <>
         <input
           ref={fileInputRef}
           type="file"
@@ -689,6 +713,7 @@ export function AccountsPage() {
                           ) : null}
                         </div>
                       ) : null}
+                      {account.proxyName ? <div className="mt-0.5 truncate text-xs text-muted-foreground" title={account.proxyName}>{t("accounts.boundProxy")} · {account.proxyName}{!account.proxyEnabled ? ` · ${t("common.disabled")}` : ""}</div> : null}
                     </TableCell>
                     <TableCell className="text-center whitespace-nowrap">{provider === "grok_web" ? <WebAccountType tier={account.webTier} /> : provider === "grok_console" ? <AccountTypeText label={t("accountType.console")} variant="free" /> : <AccountType quota={account.quota} />}</TableCell>
                     <TableCell className="text-center whitespace-nowrap"><AccountStatus account={account} /></TableCell>
@@ -723,6 +748,7 @@ export function AccountsPage() {
           </Table>
         ) : null}
         </DataTableShell>
+        </>}
       </div>
 
       <AlertDialog open={syncAllOpen} onOpenChange={(open) => { if (!open) quotaSyncAbortRef.current?.abort(); setSyncAllOpen(open); }}>
@@ -860,6 +886,18 @@ export function AccountsPage() {
               <div className="space-y-2"><Label htmlFor="account-concurrency">{t("accounts.maxConcurrent")}</Label><Input id="account-concurrency" type="number" min="1" max="256" {...form.register("maxConcurrent", { valueAsNumber: true })} /></div>
             </div>
             <div className="space-y-2"><Label htmlFor="account-minimum">{t("accounts.minimumRemaining")}</Label><Input id="account-minimum" type="number" min="0" step="0.01" {...form.register("minimumRemaining", { valueAsNumber: true })} /></div>
+            <div className="space-y-2">
+              <Label htmlFor="account-proxy">{t("accounts.boundProxy")}</Label>
+              <Select value={accountProxyID} onValueChange={(value) => form.setValue("proxyId", value)}>
+                <SelectTrigger id="account-proxy"><SelectValue placeholder={t("accounts.selectProxy")} /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">{t("accounts.sharedEgress")}</SelectItem>
+                  {editing?.proxyId && !proxyOptionsQuery.data?.some((value) => value.id === editing.proxyId) ? <SelectItem value={editing.proxyId}>{editing.proxyName ?? editing.proxyId} ({t("common.disabled")})</SelectItem> : null}
+                  {proxyOptionsQuery.data?.map((value) => <SelectItem key={value.id} value={value.id}>{value.name} · {value.protocol.toUpperCase()} · {value.address}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("accounts.proxyBindingHint")}</p>
+            </div>
             {editing && editing.provider !== "grok_build" ? (
               <div className="space-y-2">
                 <Label htmlFor="account-cloudflare-cookie">{t("settings.egress.cloudflareCookie")}</Label>

@@ -12,6 +12,7 @@ import (
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	"github.com/chenyme/grok2api/backend/internal/domain/model"
+	"github.com/chenyme/grok2api/backend/internal/domain/proxy"
 )
 
 func toAdminDomain(value adminModel) admin.Admin {
@@ -23,6 +24,21 @@ func toSessionDomain(value adminSessionModel) admin.Session {
 }
 
 func toAccountDomain(value accountModel) account.Credential {
+	var familyID uint64
+	var proxyID *uint64
+	var proxyName, encryptedProxyURL string
+	var proxyEnabled bool
+	if value.FamilyID != nil {
+		familyID = *value.FamilyID
+	}
+	if value.Family != nil {
+		proxyID = value.Family.ProxyID
+		if value.Family.Proxy != nil {
+			proxyName = value.Family.Proxy.Name
+			encryptedProxyURL = value.Family.Proxy.EncryptedURL
+			proxyEnabled = value.Family.Proxy.Enabled
+		}
+	}
 	var expiresAt time.Time
 	var refreshDueAt, lastRefreshAt *time.Time
 	var refreshFailures int
@@ -54,7 +70,8 @@ func toAccountDomain(value accountModel) account.Credential {
 		webTierSyncedAt = value.WebProfile.SyncedAt
 	}
 	return account.Credential{
-		ID: value.ID, Provider: account.Provider(value.Provider), AuthType: authType, Name: value.Name, Email: value.Email,
+		ID: value.ID, FamilyID: familyID, ProxyID: proxyID, ProxyName: proxyName, EncryptedProxyURL: encryptedProxyURL, ProxyEnabled: proxyEnabled,
+		Provider: account.Provider(value.Provider), AuthType: authType, Name: value.Name, Email: value.Email,
 		UserID: value.UserID, TeamID: value.TeamID, SourceKey: value.SourceKey, OIDCClientID: clientID,
 		EncryptedAccessToken: encryptedPrimary, EncryptedRefreshToken: encryptedRefresh, EncryptedCloudflareCookie: encryptedCloudflareCookie,
 		ExpiresAt: expiresAt, RefreshDueAt: refreshDueAt, LastRefreshAt: lastRefreshAt,
@@ -69,13 +86,45 @@ func toAccountDomain(value accountModel) account.Credential {
 
 func fromAccountDomain(value account.Credential) accountModel {
 	return accountModel{
-		ID: value.ID, IdentityKey: accountIdentity(value), Provider: string(value.Provider), Name: value.Name, Email: value.Email,
+		ID: value.ID, FamilyID: optionalUint64(value.FamilyID), IdentityKey: accountIdentity(value), Provider: string(value.Provider), Name: value.Name, Email: value.Email,
 		UserID: value.UserID, TeamID: value.TeamID, SourceKey: value.SourceKey,
 		Enabled: value.Enabled, AuthStatus: string(value.AuthStatus), Priority: value.Priority,
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt,
 		BuildAPIFallback: value.BuildAPIFallback, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+	}
+}
+
+// optionalUint64 将零值标识转换为数据库可空外键。
+// 参数 value 为领域标识；返回零值对应 nil，非零值对应其指针。
+func optionalUint64(value uint64) *uint64 {
+	if value == 0 {
+		return nil
+	}
+	copy := value
+	return &copy
+}
+
+// toProxyDomain 将代理持久化模型转换为领域对象。
+// 参数 value 为数据库模型；返回不解密敏感地址的代理领域对象。
+func toProxyDomain(value proxyModel) proxy.Endpoint {
+	return proxy.Endpoint{
+		ID: value.ID, Name: value.Name, Protocol: value.Protocol, Host: value.Host, Port: value.Port,
+		EncryptedURL: value.EncryptedURL, AuthConfigured: value.AuthConfigured, Enabled: value.Enabled,
+		LastTestOK: value.LastTestOK, LastLatencyMS: value.LastLatencyMS, LastTestError: value.LastTestError,
+		LastTestAt: value.LastTestAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+	}
+}
+
+// fromProxyDomain 将代理领域对象转换为持久化模型。
+// 参数 value 为代理领域对象；返回可写入数据库的模型。
+func fromProxyDomain(value proxy.Endpoint) proxyModel {
+	return proxyModel{
+		ID: value.ID, Name: value.Name, Protocol: value.Protocol, Host: value.Host, Port: value.Port,
+		EncryptedURL: value.EncryptedURL, AuthConfigured: value.AuthConfigured, Enabled: value.Enabled,
+		LastTestOK: value.LastTestOK, LastLatencyMS: value.LastLatencyMS, LastTestError: value.LastTestError,
+		LastTestAt: value.LastTestAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
 

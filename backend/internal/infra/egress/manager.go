@@ -24,6 +24,7 @@ import (
 const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 const nodeSnapshotTTL = time.Second
 const stickyProxyRetryLimit = 2
+const boundProxyNodeMask uint64 = 1 << 63
 
 type Lease struct {
 	NodeID    uint64
@@ -116,8 +117,71 @@ func (m *Manager) AcquireCredential(ctx context.Context, scope domain.Scope, cre
 		identity = "sso_" + security.HashToken(token)[:32]
 	}
 	ctx = WithAccountIdentity(ctx, identity)
+	if credential.ProxyID != nil {
+		return m.acquireBoundProxy(ctx, scope, credential, credentialCookies)
+	}
 	lease, _, err := m.acquire(ctx, scope, strconv.FormatUint(credential.ID, 10), true, credentialCookies)
 	return lease, err
+}
+
+// AcquireBoundCredential 仅在账号组已绑定固定代理时获取严格代理租约。
+// 参数 ctx 为请求上下文，scope 为出口作用域，credential 为账号凭据；返回租约、是否存在绑定和错误。
+func (m *Manager) AcquireBoundCredential(ctx context.Context, scope domain.Scope, credential accountdomain.Credential) (*Lease, bool, error) {
+	if credential.ProxyID == nil {
+		return nil, false, nil
+	}
+	lease, err := m.AcquireCredential(ctx, scope, credential)
+	return lease, true, err
+}
+
+// acquireBoundProxy 为逻辑账号组构造不可回退的固定代理租约。
+// 参数 ctx 为请求上下文，scope 为出口作用域，credential 为账号凭据，credentialCookies 为账号 Cookie；返回租约或严格失败错误。
+func (m *Manager) acquireBoundProxy(ctx context.Context, scope domain.Scope, credential accountdomain.Credential, credentialCookies string) (*Lease, error) {
+	if credential.ProxyID == nil || *credential.ProxyID == 0 || *credential.ProxyID >= boundProxyNodeMask {
+		return nil, errors.New("逻辑账号组绑定的代理标识无效")
+	}
+	if !credential.ProxyEnabled {
+		return nil, fmt.Errorf("逻辑账号组绑定代理 %q 已停用", credential.ProxyName)
+	}
+	proxyURL, err := m.cipher.Decrypt(credential.EncryptedProxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("解密逻辑账号组绑定代理: %w", err)
+	}
+	proxyURL, err = application.NormalizeProxyURL(proxyURL)
+	if err != nil || proxyURL == "" {
+		return nil, errors.New("逻辑账号组绑定代理配置无效")
+	}
+	sticky := strings.Contains(proxyURL, application.ProxyAccountPlaceholder)
+	if sticky {
+		proxyURL, err = renderAccountProxyURL(proxyURL, accountFromContext(ctx))
+		if err != nil {
+			return nil, err
+		}
+	}
+	userAgent := ""
+	if scope != domain.ScopeBuild {
+		userAgent = DefaultUserAgent
+	}
+	internalNodeID := boundProxyNodeMask | *credential.ProxyID
+	client, err := m.clientFor(internalNodeID, scope, proxyURL, userAgent, credentialCookies, sticky)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.inflight[internalNodeID]++
+	m.mu.Unlock()
+	recordSelection(ctx, Selection{NodeID: *credential.ProxyID, NodeName: credential.ProxyName, Scope: scope, Proxied: true})
+	var once sync.Once
+	return &Lease{NodeID: internalNodeID, NodeName: credential.ProxyName, Scope: scope, ProxyURL: proxyURL, UserAgent: userAgent, CFCookies: credentialCookies, client: client.client, browser: client.browser, sticky: sticky, release: func() {
+		once.Do(func() {
+			m.mu.Lock()
+			m.inflight[internalNodeID]--
+			if m.inflight[internalNodeID] <= 0 {
+				delete(m.inflight, internalNodeID)
+			}
+			m.mu.Unlock()
+		})
+	}}, nil
 }
 
 func (m *Manager) AcquireIfConfigured(ctx context.Context, scope domain.Scope, affinity string) (*Lease, bool, error) {
@@ -357,7 +421,7 @@ func (m *Manager) clientFor(id uint64, scope domain.Scope, proxyURL, userAgent, 
 	// 直连节点统一使用 ID 0，不同 Provider 的传输必须并存，避免 Build 与 Web 互相重建客户端。
 	if id != 0 && !sticky {
 		for previousKey, previous := range m.clients {
-			if previousKey.nodeID != id {
+			if previousKey.nodeID != id || previousKey.scope != cacheScope {
 				continue
 			}
 			if previous.client != nil {
@@ -375,6 +439,14 @@ func (m *Manager) Feedback(ctx context.Context, nodeID uint64, status int, trans
 }
 
 func (m *Manager) FeedbackForScope(ctx context.Context, scope domain.Scope, nodeID uint64, status int, transportErr error) {
+	if nodeID&boundProxyNodeMask != 0 {
+		if transportErr != nil || status >= 500 || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
+			m.mu.Lock()
+			m.invalidateClientForScopeLocked(nodeID, scope)
+			m.mu.Unlock()
+		}
+		return
+	}
 	if nodeID == 0 {
 		if transportErr != nil || status >= 500 || (scope != domain.ScopeBuild && status == http.StatusForbidden) {
 			m.mu.Lock()

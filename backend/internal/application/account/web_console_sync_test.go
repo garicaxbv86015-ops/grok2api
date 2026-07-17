@@ -93,6 +93,13 @@ func TestSyncWebAccountsToConsoleIsIdempotentAndPreservesBuildLink(t *testing.T)
 	if consoleAccount.Provider != accountdomain.ProviderConsole || consoleAccount.Name != "Grok Console primary" || decrypted != token {
 		t.Fatalf("console account = %#v, token = %q", consoleAccount, decrypted)
 	}
+	linkedBuildAccount, err := accounts.Get(ctx, buildAccount.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consoleAccount.FamilyID == 0 || consoleAccount.FamilyID != webAccount.FamilyID || linkedBuildAccount.FamilyID != webAccount.FamilyID {
+		t.Fatalf("logical family web=%d build=%d console=%d", webAccount.FamilyID, linkedBuildAccount.FamilyID, consoleAccount.FamilyID)
+	}
 	consoleCookie, err := cipher.Decrypt(consoleAccount.EncryptedCloudflareCookie)
 	if err != nil {
 		t.Fatal(err)

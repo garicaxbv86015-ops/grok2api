@@ -24,8 +24,60 @@ type adminSessionModel struct {
 
 func (adminSessionModel) TableName() string { return "admin_sessions" }
 
+type proxyModel struct {
+	// ID 是代理资源唯一标识。
+	ID              uint64     `gorm:"primaryKey;autoIncrement"`
+	// Name 是管理端展示名称。
+	Name            string     `gorm:"size:160;uniqueIndex;not null;check:chk_proxies_name,length(trim(name)) BETWEEN 1 AND 160"`
+	// Protocol 是规范化代理协议。
+	Protocol        string     `gorm:"size:16;not null;check:chk_proxies_protocol,protocol IN ('http','https','socks5','socks5h')"`
+	// Host 是不含认证信息的代理主机。
+	Host            string     `gorm:"size:255;not null;check:chk_proxies_host,length(trim(host)) BETWEEN 1 AND 255"`
+	// Port 是代理服务端口。
+	Port            int        `gorm:"not null;check:chk_proxies_port,port BETWEEN 1 AND 65535"`
+	// EncryptedURL 是包含认证信息的加密完整地址。
+	EncryptedURL    string     `gorm:"type:text;not null;check:chk_proxies_encrypted_url,length(encrypted_url) BETWEEN 1 AND 65536"`
+	// AuthConfigured 表示完整地址中是否包含认证信息。
+	AuthConfigured  bool       `gorm:"not null;default:false"`
+	// Enabled 表示已绑定账号是否允许使用该代理。
+	Enabled         bool       `gorm:"not null;default:true"`
+	// LastTestOK 是最近连接测试结果。
+	LastTestOK      *bool
+	// LastLatencyMS 是最近成功测试耗时。
+	LastLatencyMS   *int64
+	// LastTestError 是最近测试的安全错误摘要。
+	LastTestError   string     `gorm:"size:512;not null;default:'';check:chk_proxies_last_test_error,length(last_test_error) <= 512"`
+	// LastTestAt 是最近测试时间。
+	LastTestAt      *time.Time
+	// CreatedAt 是创建时间。
+	CreatedAt       time.Time  `gorm:"not null"`
+	// UpdatedAt 是最后更新时间。
+	UpdatedAt       time.Time  `gorm:"not null"`
+}
+
+// TableName 返回通用代理资源的数据库表名。
+func (proxyModel) TableName() string { return "proxies" }
+
+type accountFamilyModel struct {
+	// ID 是逻辑账号组唯一标识。
+	ID        uint64      `gorm:"primaryKey;autoIncrement"`
+	// ProxyID 是账号组可空的固定代理外键。
+	ProxyID   *uint64     `gorm:"index"`
+	// CreatedAt 是账号组创建时间。
+	CreatedAt time.Time   `gorm:"not null"`
+	// UpdatedAt 是账号组最后更新时间。
+	UpdatedAt time.Time   `gorm:"not null"`
+	// Proxy 是账号组绑定的固定代理关联。
+	Proxy     *proxyModel `gorm:"foreignKey:ProxyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
+}
+
+// TableName 返回逻辑账号组的数据库表名。
+func (accountFamilyModel) TableName() string { return "account_families" }
+
 type accountModel struct {
 	ID               uint64  `gorm:"primaryKey;autoIncrement"`
+	// FamilyID 是 Web、Build、Console 共享的逻辑账号组外键。
+	FamilyID         *uint64 `gorm:"index"`
 	IdentityKey      string  `gorm:"size:64;uniqueIndex;not null;check:chk_accounts_identity_key,length(identity_key) = 64"`
 	Provider         string  `gorm:"size:32;not null;check:chk_accounts_provider,provider IN ('grok_build','grok_web','grok_console');index:idx_accounts_provider_source,priority:1"`
 	Name             string  `gorm:"size:160;not null;check:chk_accounts_name,length(trim(name)) BETWEEN 1 AND 160"`
@@ -48,6 +100,8 @@ type accountModel struct {
 	BuildAPIFallback bool                    `gorm:"not null;default:false"`
 	CreatedAt        time.Time               `gorm:"not null"`
 	UpdatedAt        time.Time               `gorm:"not null"`
+	// Family 是账号所属逻辑账号组及其固定代理关联。
+	Family           *accountFamilyModel     `gorm:"foreignKey:FamilyID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:RESTRICT"`
 	Credential       *accountCredentialModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 	WebProfile       *webAccountProfileModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
 }

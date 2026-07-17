@@ -126,6 +126,8 @@ func (p *accountSyncPipeline) reportProgress() {
 }
 
 func (h *Handler) Register(router *gin.RouterGroup) {
+	router.GET("/account-families", h.listFamilies)
+	router.PATCH("/account-families/:id/proxy", h.updateFamilyProxy)
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
@@ -160,6 +162,13 @@ type updateRequest struct {
 	MinimumRemaining       *float64 `json:"minimumRemaining"`
 	CloudflareCookies      *string  `json:"cloudflareCookies"`
 	ClearCloudflareCookies bool     `json:"clearCloudflareCookies"`
+	ProxyID                *uint64  `json:"proxyId,string"`
+	ClearProxy             bool     `json:"clearProxy"`
+}
+
+type familyProxyRequest struct {
+	ProxyID    *uint64 `json:"proxyId,string"`
+	ClearProxy bool    `json:"clearProxy"`
 }
 
 type batchUpdateRequest struct {
@@ -224,6 +233,10 @@ type accountImportResponse struct {
 
 type accountResponse struct {
 	ID                         uint64                `json:"id,string"`
+	FamilyID                   uint64                `json:"familyId,string"`
+	ProxyID                    *uint64               `json:"proxyId,omitempty,string"`
+	ProxyName                  string                `json:"proxyName,omitempty"`
+	ProxyEnabled               bool                  `json:"proxyEnabled"`
 	Provider                   string                `json:"provider"`
 	AuthType                   string                `json:"authType"`
 	WebTier                    string                `json:"webTier,omitempty"`
@@ -257,6 +270,25 @@ type accountResponse struct {
 	Billing                    *billingResponse      `json:"billing,omitempty"`
 	Quota                      quotaResponse         `json:"quota"`
 	QuotaWindows               []quotaWindowResponse `json:"quotaWindows,omitempty"`
+}
+
+type accountFamilyResponse struct {
+	ID           uint64                        `json:"id,string"`
+	ProxyID      *uint64                       `json:"proxyId,omitempty,string"`
+	ProxyName    string                        `json:"proxyName,omitempty"`
+	ProxyEnabled bool                          `json:"proxyEnabled"`
+	Members      []accountFamilyMemberResponse `json:"members"`
+	CreatedAt    time.Time                     `json:"createdAt"`
+	UpdatedAt    time.Time                     `json:"updatedAt"`
+}
+
+type accountFamilyMemberResponse struct {
+	ID         uint64 `json:"id,string"`
+	Provider   string `json:"provider"`
+	Name       string `json:"name"`
+	Email      string `json:"email,omitempty"`
+	Enabled    bool   `json:"enabled"`
+	AuthStatus string `json:"authStatus"`
 }
 
 type quotaWindowResponse struct {
@@ -346,6 +378,41 @@ func (h *Handler) list(c *gin.Context) {
 		items = append(items, newAccountResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// listFamilies 返回逻辑账号组分页列表和组内 Provider 凭据摘要。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) listFamilies(c *gin.Context) {
+	page, pageSize := pagination(c)
+	values, total, err := h.service.ListFamilies(c.Request.Context(), page, pageSize, c.Query("search"))
+	if err != nil {
+		response.Error(c, http.StatusInternalServerError, "accountFamilyListFailed", "读取逻辑账号失败")
+		return
+	}
+	items := make([]accountFamilyResponse, 0, len(values))
+	for _, value := range values {
+		items = append(items, newAccountFamilyResponse(value))
+	}
+	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// updateFamilyProxy 绑定、切换或解除逻辑账号组的固定代理。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) updateFamilyProxy(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var request familyProxyRequest
+	if c.ShouldBindJSON(&request) != nil {
+		response.Error(c, http.StatusBadRequest, "invalidRequest", "请求参数无效")
+		return
+	}
+	if err := h.service.UpdateFamilyProxy(c.Request.Context(), id, request.ProxyID, request.ClearProxy); err != nil {
+		h.writeServiceError(c, "accountFamilyProxyUpdateFailed", err, http.StatusInternalServerError, "更新逻辑账号代理失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"updated": true})
 }
 
 func (h *Handler) summary(c *gin.Context) {
@@ -904,6 +971,7 @@ func (h *Handler) update(c *gin.Context) {
 		Name: request.Name, Enabled: request.Enabled, Priority: request.Priority,
 		MaxConcurrent: request.MaxConcurrent, MinimumRemaining: request.MinimumRemaining,
 		CloudflareCookies: request.CloudflareCookies, ClearCloudflareCookies: request.ClearCloudflareCookies,
+		ProxyID: request.ProxyID, ClearProxy: request.ClearProxy,
 	})
 	if err != nil {
 		h.writeServiceError(c, "accountUpdateFailed", err, http.StatusInternalServerError, "更新账号失败")
@@ -1017,7 +1085,8 @@ func (h *Handler) refreshAllConsoleQuotas(c *gin.Context) {
 func newAccountResponse(value accountapp.View) accountResponse {
 	c := value.Credential
 	result := accountResponse{
-		ID: c.ID, Provider: string(c.Provider), AuthType: string(c.AuthType), WebTier: string(c.WebTier),
+		ID: c.ID, FamilyID: c.FamilyID, ProxyID: c.ProxyID, ProxyName: c.ProxyName, ProxyEnabled: c.ProxyEnabled,
+		Provider: string(c.Provider), AuthType: string(c.AuthType), WebTier: string(c.WebTier),
 		WebTierSyncedAt: c.WebTierSyncedAt, Name: c.Name, Email: c.Email, UserID: c.UserID, TeamID: c.TeamID,
 		Enabled: c.Enabled, AuthStatus: string(c.AuthStatus), Refreshable: c.EncryptedRefreshToken != "",
 		RefreshDueAt: c.RefreshDueAt, LastRefreshAt: c.LastRefreshAt,
@@ -1050,6 +1119,22 @@ func newAccountResponse(value accountapp.View) accountResponse {
 		result.Billing = &billing
 	}
 	return result
+}
+
+// newAccountFamilyResponse 将逻辑账号组领域对象转换为管理端安全响应。
+// 参数 value 为逻辑账号组；返回不含凭据和代理密文的响应对象。
+func newAccountFamilyResponse(value accountdomain.Family) accountFamilyResponse {
+	members := make([]accountFamilyMemberResponse, 0, len(value.Members))
+	for _, member := range value.Members {
+		members = append(members, accountFamilyMemberResponse{
+			ID: member.ID, Provider: string(member.Provider), Name: member.Name, Email: member.Email,
+			Enabled: member.Enabled, AuthStatus: string(member.AuthStatus),
+		})
+	}
+	return accountFamilyResponse{
+		ID: value.ID, ProxyID: value.ProxyID, ProxyName: value.ProxyName, ProxyEnabled: value.ProxyEnabled,
+		Members: members, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
+	}
 }
 
 func newQuotaResponse(value accountapp.QuotaView) quotaResponse {

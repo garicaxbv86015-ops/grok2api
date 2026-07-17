@@ -23,6 +23,8 @@ type AccountUpsertResult struct {
 // AccountRepository 定义 OAuth 账号和额度快照持久化能力。
 type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)
+	// ListFamilies 分页返回逻辑账号组及其 Web、Build、Console 成员摘要。
+	ListFamilies(ctx context.Context, query AccountFamilyListQuery) ([]account.Family, int64, error)
 	// ListProviderAccountBatch 以 ID 游标取一批账号；total 仅在 afterID 为 0 时返回。
 	ListProviderAccountBatch(ctx context.Context, provider account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error)
 	Summarize(ctx context.Context, now time.Time) ([]AccountSummary, error)
@@ -39,6 +41,8 @@ type AccountRepository interface {
 	HasActive(ctx context.Context, provider account.Provider) (bool, error)
 	ListRoutingCandidates(ctx context.Context, provider account.Provider, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error)
 	Get(ctx context.Context, id uint64) (account.Credential, error)
+	// SetFamilyProxy 更新整个逻辑账号组的固定代理绑定，proxyID 为 nil 时解除绑定。
+	SetFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64) error
 	LinkWebToBuild(ctx context.Context, webAccountID, buildAccountID uint64) error
 	GetBillings(ctx context.Context, accountIDs []uint64) (map[uint64]account.Billing, error)
 	GetQuotaRecoveries(ctx context.Context, accountIDs []uint64) (map[uint64]account.QuotaRecovery, error)

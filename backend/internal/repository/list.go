@@ -51,6 +51,23 @@ type AccountListQuery struct {
 	Filter AccountListFilter
 }
 
+// AccountFamilyListQuery 表示管理端逻辑账号组分页查询。
+type AccountFamilyListQuery struct {
+	Page PageQuery
+}
+
+// ProxyListFilter 表示代理列表支持的固定过滤条件。
+type ProxyListFilter struct {
+	Enabled  *bool
+	Protocol string
+}
+
+// ProxyListQuery 表示管理端代理分页查询。
+type ProxyListQuery struct {
+	Page   PageQuery
+	Filter ProxyListFilter
+}
+
 type AccountSummary struct {
 	Provider       string
 	Total          int64

@@ -93,6 +93,46 @@ func TestConfiguredCoolingAppNodesNeverFallBackToDirect(t *testing.T) {
 	}
 }
 
+// TestBoundAccountProxyUsesStrictLease 验证账号组固定代理优先于共享出口，并在审计中记录代理资源。
+func TestBoundAccountProxyUsesStrictLease(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("http://127.0.0.1:18080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID := uint64(29)
+	manager := NewManager(egressRepositoryTestStub{}, cipher)
+	ctx, trace := WithTrace(context.Background())
+	lease, err := manager.AcquireCredential(ctx, domain.ScopeBuild, accountdomain.Credential{ID: 7, Provider: accountdomain.ProviderBuild, ProxyID: &proxyID, ProxyName: "固定代理", ProxyEnabled: true, EncryptedProxyURL: encrypted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID&boundProxyNodeMask == 0 || lease.ProxyURL != "http://127.0.0.1:18080" {
+		t.Fatalf("lease = %#v", lease)
+	}
+	selection, ok := trace.Selection(domain.ScopeBuild)
+	if !ok || selection.NodeID != proxyID || selection.NodeName != "固定代理" || !selection.Proxied {
+		t.Fatalf("selection = %#v, ok=%v", selection, ok)
+	}
+}
+
+// TestDisabledBoundAccountProxyNeverFallsBack 验证已停用固定代理不会回退到共享出口或直连。
+func TestDisabledBoundAccountProxyNeverFallsBack(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyID := uint64(30)
+	manager := NewManager(egressRepositoryTestStub{}, cipher)
+	if _, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{ID: 8, Provider: accountdomain.ProviderWeb, ProxyID: &proxyID, ProxyName: "停用代理"}); err == nil {
+		t.Fatal("停用固定代理意外回退到其他出口")
+	}
+}
+
 func TestAcquireIfConfiguredDoesNotChangeBuildDirectTransport(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {

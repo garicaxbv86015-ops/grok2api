@@ -81,6 +81,16 @@ const (
 // Credential 表示持久化的上游 OAuth 账号。
 type Credential struct {
 	ID                        uint64
+	// FamilyID 是 Web、Build、Console 共用的逻辑账号组标识。
+	FamilyID                  uint64
+	// ProxyID 是逻辑账号组绑定的固定代理标识，未绑定时为 nil。
+	ProxyID                   *uint64
+	// ProxyName 是逻辑账号组绑定代理的管理端展示名称。
+	ProxyName                 string
+	// EncryptedProxyURL 是绑定代理的加密地址，仅供出口层解密使用。
+	EncryptedProxyURL         string
+	// ProxyEnabled 表示绑定代理当前是否启用。
+	ProxyEnabled              bool
 	Provider                  Provider
 	AuthType                  AuthType
 	Name                      string

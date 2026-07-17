@@ -4,11 +4,17 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
+
+	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	"gorm.io/gorm"
 )
 
 var schemaModels = []any{
 	&adminModel{},
 	&adminSessionModel{},
+	&proxyModel{},
+	&accountFamilyModel{},
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},
@@ -39,6 +45,9 @@ var schemaModels = []any{
 var schemaIndexes = []string{
 	"CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin_created ON admin_sessions(admin_id, created_at DESC, id DESC)",
 	"CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)",
+	"CREATE INDEX IF NOT EXISTS idx_proxies_enabled_name ON proxies(enabled, name, id)",
+	"CREATE INDEX IF NOT EXISTS idx_account_families_proxy ON account_families(proxy_id, id)",
+	"CREATE INDEX IF NOT EXISTS idx_accounts_family_provider ON provider_accounts(family_id, provider, id)",
 	// SQLite 通过重建表修改 CHECK 约束，重建会删除独立存储的 GORM 唯一索引；
 	// 在统一索引阶段显式恢复这些数据完整性约束。
 	"CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_identity_key ON provider_accounts(identity_key)",
@@ -87,8 +96,22 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 			return fmt.Errorf("清理旧版所有域出口节点: %w", err)
 		}
 	}
-	if err := db.AutoMigrate(schemaModels...); err != nil {
-		return fmt.Errorf("初始化数据库表: %w", err)
+	migrate := func() error {
+		return d.db.WithContext(ctx).AutoMigrate(schemaModels...)
+	}
+	var migrateErr error
+	if d.dialect == "sqlite" {
+		// SQLite 的 AutoMigrate 会通过 DROP/RENAME 重建账号父表；必须先关闭外键，
+		// 否则历史凭据、额度和关联关系会被 ON DELETE CASCADE 一并删除。
+		migrateErr = d.withSQLiteForeignKeysDisabled(ctx, migrate)
+	} else {
+		migrateErr = migrate()
+	}
+	if migrateErr != nil {
+		return fmt.Errorf("初始化数据库表: %w", migrateErr)
+	}
+	if err := d.ensureAccountFamilies(ctx); err != nil {
+		return fmt.Errorf("迁移逻辑账号组: %w", err)
 	}
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
@@ -108,6 +131,101 @@ func (d *Database) InitializeSchema(ctx context.Context) error {
 		return fmt.Errorf("迁移模型 Provider 命名空间: %w", err)
 	}
 	return nil
+}
+
+// ensureAccountFamilies 将历史 Web、Build、Console 凭据幂等归入同一逻辑账号组。
+// 参数 ctx 为数据库迁移上下文；返回迁移失败原因，成功时返回 nil。
+func (d *Database) ensureAccountFamilies(ctx context.Context) error {
+	return d.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		type familyAccount struct {
+			ID        uint64
+			Provider  string
+			SourceKey string
+			FamilyID  *uint64
+		}
+		var accounts []familyAccount
+		if err := tx.Model(&accountModel{}).Select("id", "provider", "source_key", "family_id").Order("id ASC").Scan(&accounts).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		webFamilies := make(map[uint64]uint64)
+		webFamiliesBySource := make(map[string]uint64)
+		accountFamilies := make(map[uint64]uint64)
+		// 1. Web 账号是历史转换关系的根，优先保留或创建其逻辑账号组。
+		for index := range accounts {
+			value := &accounts[index]
+			if value.Provider != string(account.ProviderWeb) {
+				continue
+			}
+			familyID, err := ensureAccountFamily(tx, value.ID, value.FamilyID, now)
+			if err != nil {
+				return err
+			}
+			value.FamilyID = &familyID
+			webFamilies[value.ID] = familyID
+			webFamiliesBySource[value.SourceKey] = familyID
+			accountFamilies[value.ID] = familyID
+		}
+		// 2. 显式 Web→Build 转换关系始终继承 Web 的逻辑账号组。
+		var links []accountProviderLinkModel
+		if err := tx.Find(&links).Error; err != nil {
+			return err
+		}
+		for _, link := range links {
+			familyID, exists := webFamilies[link.WebAccountID]
+			if !exists {
+				continue
+			}
+			if err := tx.Model(&accountModel{}).Where("id = ?", link.BuildAccountID).Update("family_id", familyID).Error; err != nil {
+				return err
+			}
+			accountFamilies[link.BuildAccountID] = familyID
+		}
+		// 3. Console 历史账号按既有 console-<web source_key> 规则继承 Web 逻辑账号组。
+		for _, value := range accounts {
+			if value.Provider != string(account.ProviderConsole) || !strings.HasPrefix(value.SourceKey, "console-") {
+				continue
+			}
+			familyID, exists := webFamiliesBySource[strings.TrimPrefix(value.SourceKey, "console-")]
+			if !exists {
+				continue
+			}
+			if err := tx.Model(&accountModel{}).Where("id = ?", value.ID).Update("family_id", familyID).Error; err != nil {
+				return err
+			}
+			accountFamilies[value.ID] = familyID
+		}
+		// 4. 其余独立账号各自创建逻辑账号组，保证迁移后所有账号都可绑定代理。
+		for _, value := range accounts {
+			if _, exists := accountFamilies[value.ID]; exists {
+				continue
+			}
+			if _, err := ensureAccountFamily(tx, value.ID, value.FamilyID, now); err != nil {
+				return err
+			}
+		}
+		// 5. 清理转换关系合并后不再包含任何 Provider 凭据的空账号组。
+		if err := tx.Where("NOT EXISTS (SELECT 1 FROM provider_accounts WHERE provider_accounts.family_id = account_families.id)").Delete(&accountFamilyModel{}).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// ensureAccountFamily 为单个账号保留或创建逻辑账号组。
+// 参数 tx 为当前事务，accountID 为账号标识，familyID 为历史组标识，now 为统一写入时间；返回逻辑账号组标识和错误。
+func ensureAccountFamily(tx *gorm.DB, accountID uint64, familyID *uint64, now time.Time) (uint64, error) {
+	if familyID != nil && *familyID != 0 {
+		return *familyID, nil
+	}
+	family := accountFamilyModel{CreatedAt: now, UpdatedAt: now}
+	if err := tx.Create(&family).Error; err != nil {
+		return 0, err
+	}
+	if err := tx.Model(&accountModel{}).Where("id = ?", accountID).Update("family_id", family.ID).Error; err != nil {
+		return 0, err
+	}
+	return family.ID, nil
 }
 
 type consoleConstraint struct {
