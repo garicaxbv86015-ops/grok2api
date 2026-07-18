@@ -166,6 +166,60 @@ func (r *AccountRepository) ListFamilies(ctx context.Context, input repository.A
 	return values, total, nil
 }
 
+// DeleteFamily 在单次事务中删除逻辑账号组及其全部 Provider 成员。
+// 参数 ctx 为请求上下文，familyID 为逻辑账号组标识；返回按 ID 排序的已删除成员标识和错误。
+func (r *AccountRepository) DeleteFamily(ctx context.Context, familyID uint64) ([]uint64, error) {
+	if familyID == 0 {
+		return nil, repository.ErrNotFound
+	}
+	accountIDs := make([]uint64, 0, 3)
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var family accountFamilyModel
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").First(&family, familyID).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&accountModel{}).Where("family_id = ?", familyID).Order("id ASC").Pluck("id", &accountIDs).Error; err != nil {
+			return err
+		}
+		// 1. 媒体任务限制删除账号，先清理任务及其上传票据；已生成媒体资产作为独立资源保留。
+		if len(accountIDs) > 0 {
+			var mediaJobIDs []string
+			if err := tx.Model(&mediaJobModel{}).Where("account_id IN ?", accountIDs).Pluck("id", &mediaJobIDs).Error; err != nil {
+				return err
+			}
+			if len(mediaJobIDs) > 0 {
+				if err := tx.Where("job_id IN ?", mediaJobIDs).Delete(&mediaUploadTicketModel{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where("id IN ?", mediaJobIDs).Delete(&mediaJobModel{}).Error; err != nil {
+					return err
+				}
+			}
+			// 2. 删除成员，复用账号外键级联清理额度、模型能力和 Provider 绑定。
+			result := tx.Where("id IN ?", accountIDs).Delete(&accountModel{})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != int64(len(accountIDs)) {
+				return fmt.Errorf("逻辑账号成员删除数量不一致: 预期 %d，实际 %d", len(accountIDs), result.RowsAffected)
+			}
+		}
+		// 3. 成员清空后删除账号组，代理资源仅解除引用且不会被删除。
+		result := tx.Delete(&accountFamilyModel{}, familyID)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return accountIDs, nil
+}
+
 func (r *AccountRepository) ListProviderAccountBatch(ctx context.Context, providerValue account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error) {
 	if limit < 1 {
 		return []account.Credential{}, 0, nil

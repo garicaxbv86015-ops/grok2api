@@ -4,11 +4,150 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	proxydomain "github.com/chenyme/grok2api/backend/internal/domain/proxy"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 )
+
+// TestAccountRepositoryDeletesLogicalFamilyWithAllMembers 验证删除逻辑账号组会清理全部成员及其子数据，同时保留代理和其他账号组；参数 t 为测试上下文；无返回值。
+func TestAccountRepositoryDeletesLogicalFamilyWithAllMembers(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	models := NewModelRepository(database)
+	proxies := NewProxyRepository(database)
+	web, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "delete-family-web",
+		SourceKey: "delete-family-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	build, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "delete-family-build",
+		SourceKey: "delete-family-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.LinkWebToBuild(ctx, web.ID, build.ID); err != nil {
+		t.Fatal(err)
+	}
+	console, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		FamilyID: web.FamilyID, Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "delete-family-console",
+		SourceKey: "delete-family-console", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyValue, err := proxies.Create(ctx, proxydomain.Endpoint{
+		Name: "delete-family-proxy", Protocol: "socks5", Host: "127.0.0.1", Port: 1082,
+		EncryptedURL: "encrypted-delete-family-proxy", Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.SetFamilyProxy(ctx, web.FamilyID, &proxyValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	peer, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "delete-family-peer",
+		SourceKey: "delete-family-peer", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := accounts.SaveBilling(ctx, account.Billing{AccountID: build.ID, SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.SaveQuotaRecovery(ctx, account.QuotaRecovery{
+		AccountID: web.ID, Kind: account.QuotaRecoveryKindFree, Status: account.QuotaRecoveryStatusExhausted, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, console.ID, []string{"grok-delete-family"}, now); err != nil {
+		t.Fatal(err)
+	}
+	clientKey := clientKeyModel{
+		Name: "delete-family-key", Prefix: "delete-family-key", SecretHash: testSecretHash,
+		EncryptedSecret: testEncryptedToken, Enabled: true, RPMLimit: 60, MaxConcurrent: 4,
+	}
+	if err := database.db.WithContext(ctx).Create(&clientKey).Error; err != nil {
+		t.Fatal(err)
+	}
+	asset := mediadomain.Asset{
+		ID: "delete_family_asset_0001", Kind: "video", StorageKey: "video/delete-family.mp4",
+		MIMEType: "video/mp4", SizeBytes: 1024, SHA256: testSecretHash, CreatedAt: now,
+	}
+	if err := NewMediaAssetRepository(database).CreateMediaAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+	job := mediadomain.Job{
+		ID: "delete_family_job_0001", RequestID: "delete-family-request", ClientKeyID: clientKey.ID, ClientKeyName: clientKey.Name,
+		AccountID: web.ID, AccountName: web.Name, Provider: string(account.ProviderWeb), Model: "grok-imagine-video",
+		ModelRouteID: 1, UpstreamModel: "grok-imagine-video", Prompt: "delete family", Seconds: 8, Size: "16:9",
+		Quality: "720p", Status: mediadomain.StatusQueued, InputJSON: `{}`, ResultAssetID: asset.ID, CreatedAt: now, UpdatedAt: now,
+	}
+	mediaJobs := NewMediaJobRepository(database)
+	if err := mediaJobs.CreateMediaJob(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	tickets := NewMediaUploadTicketRepository(database)
+	if err := tickets.CreateUploadTicket(ctx, repository.MediaUploadTicket{
+		TokenHash: testSecretHash, AssetID: asset.ID, JobID: job.ID, MaxBytes: 1024,
+		AllowedMIME: "video/mp4", ExpiresAt: now.Add(time.Hour), CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	deletedIDs, err := accounts.DeleteFamily(ctx, web.FamilyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deletedIDs) != 3 || deletedIDs[0] != web.ID || deletedIDs[1] != build.ID || deletedIDs[2] != console.ID {
+		t.Fatalf("deleted account ids = %#v", deletedIDs)
+	}
+	for _, id := range deletedIDs {
+		if _, err := accounts.Get(ctx, id); !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("deleted account %d error = %v", id, err)
+		}
+	}
+	if _, err := accounts.Get(ctx, peer.ID); err != nil {
+		t.Fatalf("peer account was affected: %v", err)
+	}
+	if _, err := proxies.Get(ctx, proxyValue.ID); err != nil {
+		t.Fatalf("bound proxy was deleted: %v", err)
+	}
+	for _, table := range []string{"account_billing_snapshots", "account_quota_recovery", "account_model_capabilities", "account_model_sync_states", "account_provider_links"} {
+		if count := tableRowCount(t, database, table); count != 0 {
+			t.Fatalf("%s rows after family delete = %d", table, count)
+		}
+	}
+	if _, err := mediaJobs.GetMediaJob(ctx, job.ID, clientKey.ID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("media job error after family delete = %v", err)
+	}
+	if _, err := tickets.GetUploadTicketByHash(ctx, testSecretHash); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("media upload ticket error after family delete = %v", err)
+	}
+	if _, err := NewMediaAssetRepository(database).GetMediaAsset(ctx, asset.ID); err != nil {
+		t.Fatalf("generated media asset was deleted: %v", err)
+	}
+	families, total, err := accounts.ListFamilies(ctx, repository.AccountFamilyListQuery{Page: repository.PageQuery{Limit: 20, Search: "delete-family-peer"}})
+	if err != nil || total != 1 || len(families) != 1 || families[0].ID != peer.FamilyID {
+		t.Fatalf("remaining families total=%d values=%#v err=%v", total, families, err)
+	}
+	deletedFamilies, deletedTotal, err := accounts.ListFamilies(ctx, repository.AccountFamilyListQuery{Page: repository.PageQuery{Limit: 20, Search: "delete-family-web"}})
+	if err != nil || deletedTotal != 0 || len(deletedFamilies) != 0 {
+		t.Fatalf("deleted families total=%d values=%#v err=%v", deletedTotal, deletedFamilies, err)
+	}
+	if _, err := accounts.DeleteFamily(ctx, web.FamilyID); !errors.Is(err, repository.ErrNotFound) {
+		t.Fatalf("missing family error = %v", err)
+	}
+}
 
 // TestAccountRepositoryListsLogicalFamiliesAndSharedProxy 验证一个逻辑账号组会聚合三类成员并只绑定一次代理。
 func TestAccountRepositoryListsLogicalFamiliesAndSharedProxy(t *testing.T) {

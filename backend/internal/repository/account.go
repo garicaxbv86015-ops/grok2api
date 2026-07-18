@@ -33,6 +33,8 @@ type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)
 	// ListFamilies 分页返回逻辑账号组及其 Web、Build、Console 成员摘要。
 	ListFamilies(ctx context.Context, query AccountFamilyListQuery) ([]account.Family, int64, error)
+	// DeleteFamily 在单次事务中删除逻辑账号组及其全部 Provider 成员；ctx 为上下文，familyID 为账号组标识；返回已删除成员标识和错误。
+	DeleteFamily(ctx context.Context, familyID uint64) ([]uint64, error)
 	// ListProviderAccountBatch 以 ID 游标取一批账号；total 仅在 afterID 为 0 时返回。
 	ListProviderAccountBatch(ctx context.Context, provider account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error)
 	Summarize(ctx context.Context, now time.Time) ([]AccountSummary, error)

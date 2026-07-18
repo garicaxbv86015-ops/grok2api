@@ -5,13 +5,17 @@ import (
 	"context"
 	"fmt"
 	"mime/multipart"
+	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/persistence/relational"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,6 +25,47 @@ type accountSynchronizerStub struct {
 
 type accountProgressSynchronizerStub struct {
 	accountSynchronizerStub
+}
+
+// TestDeleteFamilyReturnsDeletedMemberCountAndNotFound 验证逻辑账号删除接口返回成员数量，并在重复删除时返回未找到；参数 t 为测试上下文；无返回值。
+func TestDeleteFamilyReturnsDeletedMemberCountAndNotFound(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "account-family-handler.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAccountRepository(database)
+	member, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "handler-delete-family",
+		SourceKey: "handler-delete-family", EncryptedAccessToken: "encrypted-token", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(accountapp.NewService(repository, nil, nil, nil, nil, nil, nil), nil)
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodDelete, "/api/admin/v1/account-families/1", nil)
+	requestContext.Params = gin.Params{{Key: "id", Value: fmt.Sprint(member.FamilyID)}}
+	handler.deleteFamily(requestContext)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"deleted":1`) {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	requestContext, _ = gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodDelete, "/api/admin/v1/account-families/1", nil)
+	requestContext.Params = gin.Params{{Key: "id", Value: fmt.Sprint(member.FamilyID)}}
+	handler.deleteFamily(requestContext)
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), `"code":"accountNotFound"`) {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
 }
 
 func TestWriteServiceErrorUsesCredentialLimitCodes(t *testing.T) {

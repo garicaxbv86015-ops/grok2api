@@ -52,6 +52,11 @@ export function listAccountFamilies(input: AccountFamilyListInput): Promise<Pagi
   return apiRequest(`/api/admin/v1/account-families?${query}`, {}, decodeAccountFamilyPage);
 }
 
+// deleteAccountFamily 删除逻辑账号组及其全部 Provider 成员；id 为组标识；返回删除成员数量。
+export function deleteAccountFamily(id: string): Promise<{ deleted: number }> {
+  return apiRequest(`/api/admin/v1/account-families/${id}`, { method: "DELETE" }, decodeCountResult<{ deleted: number }>("deleted"));
+}
+
 // updateAccountFamilyProxy 更新单个账号组代理；id 为组标识，input 为绑定或解绑指令；返回是否更新。
 export function updateAccountFamilyProxy(id: string, input: AccountFamilyProxyInput): Promise<{ updated: boolean }> {
   return apiRequest(`/api/admin/v1/account-families/${id}/proxy`, { method: "PATCH", body: input }, decodeBooleanResult<{ updated: boolean }>("updated"));

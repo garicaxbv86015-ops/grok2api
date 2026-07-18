@@ -454,6 +454,27 @@ func (s *Service) ListFamilies(ctx context.Context, page, pageSize int, search, 
 	})
 }
 
+// DeleteFamily 删除逻辑账号组及其全部 Provider 成员，并清理成员运行态。
+// 参数 ctx 为请求上下文，familyID 为逻辑账号组标识；返回已删除成员数量和错误。
+func (s *Service) DeleteFamily(ctx context.Context, familyID uint64) (int, error) {
+	if familyID == 0 {
+		return 0, ErrNotFound
+	}
+	// 1. 先在仓储事务中完整删除账号组，避免运行态变化掩盖数据库回滚。
+	accountIDs, err := s.accounts.DeleteFamily(ctx, familyID)
+	if err != nil {
+		return 0, mapRepositoryError(err)
+	}
+	// 2. 数据库提交后逐个清理粘性会话和凭据刷新调度状态。
+	for _, accountID := range accountIDs {
+		if s.sticky != nil {
+			_ = s.sticky.DeleteByAccount(ctx, accountID)
+		}
+		s.clearRefreshState(accountID)
+	}
+	return len(accountIDs), nil
+}
+
 // UpdateFamilyProxy 更新整个逻辑账号组的固定代理绑定。
 // 参数 ctx 为请求上下文，familyID 为逻辑账号组标识，proxyID 为目标代理，clear 表示解绑；返回校验或持久化错误。
 func (s *Service) UpdateFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64, clear bool) error {

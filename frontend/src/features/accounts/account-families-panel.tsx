@@ -1,9 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, RefreshCw, Search } from "lucide-react";
+import { Pencil, RefreshCw, Search, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -12,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { AccountFamilyProxyDialog } from "@/features/accounts/account-family-proxy-dialog";
-import { batchUpdateAccountFamilyProxy, listAccountFamilies, updateAccountFamilyProxy, type AccountFamilyDTO, type AccountFamilyMemberDTO, type AccountFamilyProxyInput } from "@/features/accounts/account-families-api";
+import { batchUpdateAccountFamilyProxy, deleteAccountFamily, listAccountFamilies, updateAccountFamilyProxy, type AccountFamilyDTO, type AccountFamilyMemberDTO, type AccountFamilyProxyInput } from "@/features/accounts/account-families-api";
 import { EmptyState, ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { Pagination } from "@/shared/components/pagination";
@@ -32,6 +33,7 @@ export function AccountFamiliesPanel() {
   const [proxyBinding, setProxyBinding] = useState<ProxyBindingFilter>("all");
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [bindingTarget, setBindingTarget] = useState<BindingTarget | null>(null);
+  const [deleting, setDeleting] = useState<AccountFamilyDTO | null>(null);
   const debouncedSearch = useDebouncedValue(search);
 
   const familiesQuery = useQuery({
@@ -43,10 +45,18 @@ export function AccountFamiliesPanel() {
     onSuccess: (updated, request) => {
       setBindingTarget(null);
       setSelected(new Set());
-      void queryClient.invalidateQueries({ queryKey: ["account-families"] });
-      void queryClient.invalidateQueries({ queryKey: ["accounts"] });
-      void queryClient.invalidateQueries({ queryKey: ["proxies"] });
+      refreshAccountFamilyCaches();
       toast.success(request.target.kind === "batch" ? t("accountFamilies.batchUpdated", { count: updated }) : t("accountFamilies.proxyUpdated"));
+    },
+    onError: showAccountFamilyError,
+  });
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteAccountFamily(id),
+    onSuccess: (result) => {
+      setDeleting(null);
+      setSelected(new Set());
+      refreshAccountFamilyCaches();
+      toast.success(t("accountFamilies.deleted", { count: result.deleted }));
     },
     onError: showAccountFamilyError,
   });
@@ -54,6 +64,13 @@ export function AccountFamiliesPanel() {
   const pageIDs = result?.items.map((value) => value.id) ?? [];
   const selectedOnPage = pageIDs.filter((id) => selected.has(id));
   const allPageSelected = pageIDs.length > 0 && selectedOnPage.length === pageIDs.length;
+
+  // refreshAccountFamilyCaches 刷新逻辑账号、三个 Provider 账号和代理列表缓存；无参数；无返回值。
+  function refreshAccountFamilyCaches(): void {
+    void queryClient.invalidateQueries({ queryKey: ["account-families"] });
+    void queryClient.invalidateQueries({ queryKey: ["accounts"] });
+    void queryClient.invalidateQueries({ queryKey: ["proxies"] });
+  }
 
   // beginProxyEdit 打开单个账号组代理编辑器；value 为目标账号组；无返回值。
   function beginProxyEdit(value: AccountFamilyDTO): void {
@@ -134,9 +151,9 @@ export function AccountFamiliesPanel() {
     >
       {familiesQuery.isError ? <ErrorState message={t("accountFamilies.loadFailed")} onRetry={() => void familiesQuery.refetch()} /> : !familiesQuery.isPending && result?.items.length === 0 ? <EmptyState message={t("accountFamilies.empty")} /> : (
         <Table className="min-w-[920px] table-fixed">
-          <colgroup><col className="w-[4%]" /><col className="w-[21%]" /><col className="w-[32%]" /><col className="w-[17%]" /><col className="w-[10%]" /><col className="w-[12%]" /><col className="w-[4%]" /></colgroup>
+          <colgroup><col className="w-[4%]" /><col className="w-[20%]" /><col className="w-[30%]" /><col className="w-[17%]" /><col className="w-[10%]" /><col className="w-[12%]" /><col className="w-[7%]" /></colgroup>
           <TableHeader><TableRow>
-            <TableHead className="px-2 text-center"><Checkbox checked={allPageSelected ? true : selectedOnPage.length > 0 ? "indeterminate" : false} onCheckedChange={(checked) => togglePage(checked === true)} aria-label={t("common.selectPage")} /></TableHead><TableHead>{t("accountFamilies.logicalAccount")}</TableHead><TableHead>{t("accountFamilies.members")}</TableHead><TableHead>{t("accountFamilies.proxy")}</TableHead><TableHead>{t("accountFamilies.status")}</TableHead><TableHead>{t("accountFamilies.createdAt")}</TableHead><TableActionHead />
+            <TableHead className="px-2 text-center"><Checkbox checked={allPageSelected ? true : selectedOnPage.length > 0 ? "indeterminate" : false} onCheckedChange={(checked) => togglePage(checked === true)} aria-label={t("common.selectPage")} /></TableHead><TableHead>{t("accountFamilies.logicalAccount")}</TableHead><TableHead>{t("accountFamilies.members")}</TableHead><TableHead>{t("accountFamilies.proxy")}</TableHead><TableHead>{t("accountFamilies.status")}</TableHead><TableHead>{t("accountFamilies.createdAt")}</TableHead><TableActionHead className="w-20 min-w-20" />
           </TableRow></TableHeader>
           <TableBody>
             {familiesQuery.isPending ? <TableLoadingRow colSpan={7} /> : result?.items.map((value) => {
@@ -149,7 +166,7 @@ export function AccountFamiliesPanel() {
                 <TableCell className="text-xs"><div className="truncate font-medium" title={value.proxyName}>{value.proxyName || t("accountFamilies.unbound")}</div>{value.proxyName ? <div className="mt-0.5 text-muted-foreground">{value.proxyEnabled ? t("common.enabled") : t("common.disabled")}</div> : <div className="mt-0.5 text-muted-foreground">{t("accountFamilies.sharedEgress")}</div>}</TableCell>
                 <TableCell><Badge variant={healthy ? "secondary" : "destructive"}>{healthy ? t("accountFamilies.normal") : t("accountFamilies.abnormal")}</Badge></TableCell>
                 <TableCell className="whitespace-nowrap text-xs text-muted-foreground">{formatDateTime(value.createdAt, i18n.language)}</TableCell>
-                <TableActionCell><Button variant="ghost" size="icon" className="size-8" aria-label={t("accountFamilies.bindProxy")} onClick={() => beginProxyEdit(value)}><Pencil /></Button></TableActionCell>
+                <TableActionCell className="w-20 min-w-20"><div className="flex items-center"><Button variant="ghost" size="icon" className="size-8" aria-label={t("accountFamilies.bindProxy")} onClick={() => beginProxyEdit(value)}><Pencil /></Button><Button variant="ghost" size="icon" className="size-8 text-destructive hover:text-destructive" aria-label={t("accountFamilies.delete")} onClick={() => setDeleting(value)}><Trash2 /></Button></div></TableActionCell>
               </TableRow>;
             })}
           </TableBody>
@@ -166,6 +183,13 @@ export function AccountFamiliesPanel() {
         onClose={() => setBindingTarget(null)}
         onSubmit={submitProxyBinding}
       /> : null}
+
+      <AlertDialog open={Boolean(deleting)} onOpenChange={(open) => !open && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader><AlertDialogTitle>{t("accountFamilies.deleteTitle", { name: deleting ? primaryMember(deleting.members)?.name || deleting.id : "" })}</AlertDialogTitle><AlertDialogDescription>{t("accountFamilies.deleteDescription")}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction className="bg-destructive text-white hover:bg-destructive/90" disabled={deleteMutation.isPending} onClick={() => deleting && deleteMutation.mutate(deleting.id)}>{deleteMutation.isPending ? <Spinner /> : null}{t("common.delete")}</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </DataTableShell>
   );
 }

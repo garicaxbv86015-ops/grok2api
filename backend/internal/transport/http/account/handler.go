@@ -129,6 +129,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/account-families", h.listFamilies)
 	router.PATCH("/account-families/batch/proxy", h.batchUpdateFamilyProxy)
 	router.PATCH("/account-families/:id/proxy", h.updateFamilyProxy)
+	router.DELETE("/account-families/:id", h.deleteFamily)
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
@@ -457,6 +458,21 @@ func (h *Handler) listFamilies(c *gin.Context) {
 		items = append(items, newAccountFamilyResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// deleteFamily 删除逻辑账号组及其全部 Provider 成员。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) deleteFamily(c *gin.Context) {
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	deleted, err := h.service.DeleteFamily(c.Request.Context(), id)
+	if err != nil {
+		h.writeServiceError(c, "accountFamilyDeleteFailed", err, http.StatusInternalServerError, "删除逻辑账号失败")
+		return
+	}
+	response.Success(c, http.StatusOK, gin.H{"deleted": deleted})
 }
 
 // updateFamilyProxy 绑定、切换或解除逻辑账号组的固定代理。
