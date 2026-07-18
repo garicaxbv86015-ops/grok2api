@@ -25,6 +25,10 @@ func TestHTTPUpstreamFailureClassifiesBuildForbiddenBodies(t *testing.T) {
 			accountScoped: true, permanentAccountDenial: true,
 		},
 		{
+			name: "xai permission-denied chat endpoint", body: `{"code":"permission-denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into console.x.ai and update the permissions, or contact support."}`,
+			accountScoped: true, permanentAccountDenial: true, upstreamCode: "permission-denied",
+		},
+		{
 			name: "spending limit", body: `{"code":"personal-team-blocked:spending-limit","error":"quota exhausted"}`,
 			accountScoped: true, quotaExhausted: true, upstreamCode: "personal-team-blocked:spending-limit",
 		},
@@ -54,6 +58,9 @@ func TestRetryableResponseHonorsUpstreamRetryVeto(t *testing.T) {
 	}
 	if isRetryableResponse(response) {
 		t.Fatal("x-should-retry:false 必须禁止换账号重试")
+	}
+	if !upstreamRetryVetoed(response) {
+		t.Fatal("x-should-retry:false 应标记为上游重放否决")
 	}
 	response.Header.Set("X-Should-Retry", "true")
 	if !isRetryableResponse(response) {

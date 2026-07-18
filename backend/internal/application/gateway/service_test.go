@@ -550,6 +550,102 @@ func TestGatewayCoolsFreeBuildAccountsAfterForbidden(t *testing.T) {
 	}
 }
 
+// TestGatewaySwitchesAccountOnChatPermissionDenialDespiteRetryVeto 验证：
+// 上游 chat permission-denied 403 即使带 x-should-retry:false，也必须冷却坏号并换号成功。
+func TestGatewaySwitchesAccountOnChatPermissionDenialDespiteRetryVeto(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "permission-retry-veto.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accountRepo := relational.NewAccountRepository(database)
+	modelRepo := relational.NewModelRepository(database)
+	auditRepo := relational.NewAuditRepository(database)
+	responseRepo := relational.NewResponseRepository(database)
+	keyRepo := relational.NewClientKeyRepository(database)
+
+	denied, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "denied", SourceKey: "denied", EncryptedAccessToken: "token-denied",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+		Priority: 200, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	okAccount, _, err := accountRepo.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, Name: "ok", SourceKey: "ok", EncryptedAccessToken: "token-ok",
+		ExpiresAt: time.Now().Add(time.Hour), Enabled: true, AuthStatus: account.AuthStatusActive,
+		Priority: 100, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := modelRepo.UpsertDiscovered(ctx, account.ProviderBuild, []string{"grok-4.5"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, credential := range []account.Credential{denied, okAccount} {
+		if err := modelRepo.ReplaceAccountCapabilities(ctx, credential.ID, []string{"grok-4.5"}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clientKey, err := keyRepo.Create(ctx, clientkey.Key{
+		Name: "veto-key", Prefix: "veto", SecretHash: strings.Repeat("d", 64), EncryptedSecret: "encrypted",
+		Enabled: true, RPMLimit: 120, MaxConcurrent: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	adapter := &permissionDeniedRetryVetoAdapter{deniedAccountID: denied.ID}
+	registry := provider.NewRegistry(adapter)
+	sticky := memory.NewStickyStore()
+	accountService := accountapp.NewService(accountRepo, auditRepo, memory.NewDeviceSessionStore(), sticky, registry, testCipher(t), nil)
+	selector := NewSelector(accountRepo, memory.NewConcurrencyLimiter(), sticky, registry, time.Hour, time.Second, time.Minute)
+	service := NewService(modelRepo, auditRepo, accountService, clientkeyapp.NewService(nil, nil, nil, 60, 4, nil), registry, selector, responseRepo, 3)
+
+	result, err := service.CreateResponse(ctx, Input{
+		RequestID: "req-permission-retry-veto", ClientKey: clientKey, PublicModel: "grok-4.5",
+		Body: []byte(`{"model":"grok-4.5","input":"hello"}`),
+	})
+	if err != nil {
+		t.Fatalf("expected switch to healthy account, got %v", err)
+	}
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Finalize(Usage{}, "", "")
+	_ = result.Body.Close()
+	if string(body) != "ok-from-healthy-account" || result.StatusCode != http.StatusOK {
+		t.Fatalf("result status=%d body=%q", result.StatusCode, body)
+	}
+
+	attempts := adapter.Attempts()
+	if len(attempts) != 2 || attempts[0] != denied.ID || attempts[1] != okAccount.ID {
+		t.Fatalf("attempts = %#v, want denied then ok", attempts)
+	}
+
+	// Free Build 403 会整号冷却；chat endpoint denial 还会模型级封禁。
+	cooled, err := accountRepo.Get(ctx, denied.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cooled.FailureCount != 1 || cooled.CooldownUntil == nil || cooled.AuthStatus != account.AuthStatusActive {
+		t.Fatalf("denied account was not cooled: %#v", cooled)
+	}
+	healthy, err := accountRepo.Get(ctx, okAccount.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healthy.FailureCount != 0 || healthy.CooldownUntil != nil {
+		t.Fatalf("healthy account was incorrectly cooled: %#v", healthy)
+	}
+}
+
 func TestGatewayRefreshesAndRetriesBuildPermissionDenialOnce(t *testing.T) {
 	ctx := context.Background()
 	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "auth-rescue.db"))
@@ -1164,6 +1260,43 @@ func (a *teamModelRateLimitConsoleAdapter) Attempts() []teamModelRateLimitConsol
 type systemicForbiddenAdapter struct {
 	mu       sync.Mutex
 	attempts []uint64
+}
+
+// permissionDeniedRetryVetoAdapter 模拟 xAI 对坏号返回 permission-denied + x-should-retry:false，
+// 好号正常 200，用于验证网关仍会换号。
+type permissionDeniedRetryVetoAdapter struct {
+	mu              sync.Mutex
+	attempts        []uint64
+	deniedAccountID uint64
+}
+
+func (a *permissionDeniedRetryVetoAdapter) Provider() account.Provider { return account.ProviderBuild }
+func (a *permissionDeniedRetryVetoAdapter) Definition() provider.Definition {
+	return testConversationDefinition(account.ProviderBuild)
+}
+func (a *permissionDeniedRetryVetoAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.mu.Lock()
+	a.attempts = append(a.attempts, request.Credential.ID)
+	a.mu.Unlock()
+	if request.Credential.ID == a.deniedAccountID {
+		header := make(http.Header)
+		header.Set("X-Should-Retry", "false")
+		header.Set("Content-Type", "application/json")
+		body := `{"code":"permission-denied","error":"Access to the chat endpoint is denied. Please ensure you're using the correct credentials. If you believe this is a mistake, please log into console.x.ai and update the permissions, or contact support."}`
+		return &provider.Response{
+			StatusCode: http.StatusForbidden, Status: "403 Forbidden", Header: header,
+			Body: io.NopCloser(strings.NewReader(body)),
+		}, nil
+	}
+	return &provider.Response{
+		StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+		Body: io.NopCloser(strings.NewReader("ok-from-healthy-account")),
+	}, nil
+}
+func (a *permissionDeniedRetryVetoAdapter) Attempts() []uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]uint64(nil), a.attempts...)
 }
 
 type authRescueAdapter struct {

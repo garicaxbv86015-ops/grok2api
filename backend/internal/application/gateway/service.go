@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -612,7 +613,9 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		if isRetryableResponse(response) && !finalEgressForbidden {
+		// 先按状态码进入失败分类。x-should-retry:false 只表示「不要原样重放同一请求」，
+		// 不能阻止账号级失败（chat permission-denied / Free Build 403 等）的冷却与换号。
+		if response != nil && isRetryable(response.StatusCode) && !finalEgressForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
 			if egressForbidden {
@@ -629,88 +632,93 @@ attemptLoop:
 				// XAI 不接受 Free 账号。主 Build 403 是该账号当前不可用，必须冷却并换号。
 				lastFailure.AccountScoped = true
 			}
-			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
-				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
-				lastFailure.AccountScoped = false
-				lastFailure.Fingerprint = "429:team_model_rate_limit"
-				lastFailure.RetryAfter = time.Until(limited.Until)
+			// 非账号范围失败仍尊重上游 veto，原样把响应交给下游。
+			if upstreamRetryVetoed(response) && !lastFailure.AccountScoped {
+				response.Body = io.NopCloser(bytes.NewReader(body))
+			} else {
+				if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
+					limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
+					lastFailure.AccountScoped = false
+					lastFailure.Fingerprint = "429:team_model_rate_limit"
+					lastFailure.RetryAfter = time.Until(limited.Until)
+					lease.Release()
+					lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
+					s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
+					continue
+				}
+				if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+					authRecoveryAttempted[credential.ID] = true
+					refreshed, refreshErr := ensureCredential(credential, true)
+					if refreshErr != nil {
+						lease.Release()
+						lastErr = refreshErr
+						lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
+						continue attemptLoop
+					}
+					response, err = forwardResponse(refreshed)
+					credential = refreshed
+					if err != nil {
+						lease.Release()
+						lastErr = err
+						if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+							lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
+							break attemptLoop
+						}
+						lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+						continue attemptLoop
+					}
+					goto handleResponse
+				}
+				failureHandled := false
+				if freeBuildForbidden {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+					failureHandled = true
+				} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+					exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+					failureHandled = reconcileErr == nil && exhausted
+				} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+					failureHandled = true
+				} else if lastFailure.ModelQuotaExhausted {
+					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else if lastFailure.FreeQuotaExhausted {
+					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+					failureHandled = true
+				} else if lastFailure.QuotaExhausted {
+					failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
+				}
+				if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
+					if credential.Provider == accountdomain.ProviderBuild {
+						// A Build account can lack access to one chat model while its OAuth
+						// credential and video entitlement remain valid. Keep the denial
+						// model-scoped; only an actual credential rejection requires reauth.
+						s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					} else {
+						_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
+						s.selector.MarkQuotaStateChanged(credential.Provider)
+					}
+					failureHandled = true
+				} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
+					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
+					s.selector.MarkQuotaStateChanged(credential.Provider)
+					failureHandled = true
+				}
+				if lastFailure.AccountScoped && !failureHandled {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
 				lease.Release()
-				lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
-				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "retry_vetoed", upstreamRetryVetoed(response))
+				if !lastFailure.AccountScoped {
+					failureFingerprints[lastFailure.Fingerprint]++
+					if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+						break
+					}
+				}
 				continue
 			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
-				authRecoveryAttempted[credential.ID] = true
-				refreshed, refreshErr := ensureCredential(credential, true)
-				if refreshErr != nil {
-					lease.Release()
-					lastErr = refreshErr
-					lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
-					continue attemptLoop
-				}
-				response, err = forwardResponse(refreshed)
-				credential = refreshed
-				if err != nil {
-					lease.Release()
-					lastErr = err
-					if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
-						break attemptLoop
-					}
-					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
-					continue attemptLoop
-				}
-				goto handleResponse
-			}
-			failureHandled := false
-			if freeBuildForbidden {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				failureHandled = true
-			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = reconcileErr == nil && exhausted
-			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
-				failureHandled = true
-			} else if lastFailure.ModelQuotaExhausted {
-				s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
-				failureHandled = true
-			} else if lastFailure.FreeQuotaExhausted {
-				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
-				failureHandled = true
-			} else if lastFailure.QuotaExhausted {
-				failureHandled = s.selector.MarkPaidQuotaExhausted(ctx, credential, lease.Billing)
-			}
-			if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
-				if credential.Provider == accountdomain.ProviderBuild {
-					// A Build account can lack access to one chat model while its OAuth
-					// credential and video entitlement remain valid. Keep the denial
-					// model-scoped; only an actual credential rejection requires reauth.
-					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
-				} else {
-					_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-					s.selector.MarkQuotaStateChanged(credential.Provider)
-				}
-				failureHandled = true
-			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
-				_ = s.accounts.MarkReauthRequired(ctx, credential.ID, fmt.Sprintf("%s credential rejected", credential.Provider))
-				s.selector.MarkQuotaStateChanged(credential.Provider)
-				failureHandled = true
-			}
-			if lastFailure.AccountScoped && !failureHandled {
-				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-			}
-			lease.Release()
-			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
-			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped)
-			if !lastFailure.AccountScoped {
-				failureFingerprints[lastFailure.Fingerprint]++
-				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
-					break
-				}
-			}
-			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
@@ -1049,11 +1057,20 @@ func isRetryable(status int) bool {
 	return status == 402 || status == 403 || status == 429 || status >= 500
 }
 
+// upstreamRetryVetoed 表示上游明确禁止「原样重放」当前请求（X-Should-Retry: false）。
+// 该否决不适用于账号级失败：换其它账号是不同凭据下的新请求，不是同一请求的重放。
+func upstreamRetryVetoed(response *provider.Response) bool {
+	if response == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
+}
+
 func isRetryableResponse(response *provider.Response) bool {
 	if response == nil || !isRetryable(response.StatusCode) {
 		return false
 	}
-	return !strings.EqualFold(strings.TrimSpace(response.Header.Get("X-Should-Retry")), "false")
+	return !upstreamRetryVetoed(response)
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {
