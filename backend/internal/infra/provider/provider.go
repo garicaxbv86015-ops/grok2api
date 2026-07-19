@@ -192,20 +192,24 @@ type DeviceAuthorization struct {
 // CredentialSeed 表示登录或导入后尚未持久化的 OAuth 凭据。
 type CredentialSeed struct {
 	// FamilyID 指定导入或转换后的凭据应继承的逻辑账号组。
-	FamilyID          uint64
-	Provider          account.Provider
-	AuthType          account.AuthType
-	WebTier           account.WebTier
-	Name              string
-	Email             string
-	UserID            string
-	TeamID            string
-	SourceKey         string
-	OIDCClientID      string
-	AccessToken       string
-	RefreshToken      string
-	CloudflareCookies string
-	ExpiresAt         time.Time
+	FamilyID                uint64
+	Provider                account.Provider
+	AuthType                account.AuthType
+	WebTier                 account.WebTier
+	Name                    string
+	Email                   string
+	UserID                  string
+	TeamID                  string
+	SourceKey               string
+	OIDCClientID            string
+	AccessToken             string
+	RefreshToken            string
+	CloudflareCookies       string
+	ExpiresAt               time.Time
+	WebNSFWEnabledAt        *time.Time
+	WebTermsAcceptedAt      *time.Time
+	WebTermsAcceptedVersion int
+	WebBirthDateSetAt       *time.Time
 }
 
 type QuotaSnapshot struct {
