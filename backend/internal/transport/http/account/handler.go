@@ -129,6 +129,14 @@ func (p *accountSyncPipeline) reportProgress() {
 	p.progress(int(p.completed.Load()), int(p.queued.Load()))
 }
 
+// RegisterPublic 注册无需管理员认证的账号导入接口。
+// 参数 router 为公开的管理 API 路由分组；无返回值。
+func (h *Handler) RegisterPublic(router *gin.RouterGroup) {
+	router.POST("/account-imports", h.importAccountFamilies)
+}
+
+// Register 注册需要管理员认证的账号管理接口。
+// 参数 router 为已挂载管理员认证中间件的路由分组；无返回值。
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/account-families", h.listFamilies)
 	router.PATCH("/account-families/batch/proxy", h.batchUpdateFamilyProxy)
@@ -137,7 +145,6 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/accounts", h.list)
 	router.GET("/accounts/summary", h.summary)
 	router.GET("/accounts/export", h.exportCredentials)
-	router.POST("/account-imports", h.importAccountFamilies)
 	router.GET("/accounts/:id", h.get)
 	router.POST("/accounts/device/start", h.startDevice)
 	router.POST("/accounts/device/:sessionId/poll", h.pollDevice)
@@ -548,7 +555,7 @@ func (h *Handler) batchUpdateFamilyProxy(c *gin.Context) {
 	response.Success(c, http.StatusOK, gin.H{"updated": updated})
 }
 
-// importAccountFamilies 接收管理员鉴权的外部批量导入请求，并返回逐条原子写入结果。
+// importAccountFamilies 接收无需管理员认证的外部批量导入请求，并返回逐条原子写入结果。
 // 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
 func (h *Handler) importAccountFamilies(c *gin.Context) {
 	var request accountFamilyImportRequest

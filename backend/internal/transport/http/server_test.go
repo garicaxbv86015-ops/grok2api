@@ -93,6 +93,19 @@ func TestSystemEndpointsRequireAdminAuthentication(t *testing.T) {
 	}
 }
 
+// TestAccountImportEndpointDoesNotRequireAdminAuthentication 验证外部账号导入请求会绕过管理员认证并进入请求体校验。
+// 参数 t 为 Go 测试上下文；无返回值。
+func TestAccountImportEndpointDoesNotRequireAdminAuthentication(t *testing.T) {
+	router := New(testDependencies())
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/v1/account-imports", strings.NewReader("invalid-json"))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), `"code":"invalidRequest"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestFrontendStaticFilesAndSPAFallback(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "assets"), 0o755); err != nil {

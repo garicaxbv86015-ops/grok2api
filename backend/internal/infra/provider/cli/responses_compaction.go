@@ -36,6 +36,18 @@ type gatewayCompactionCodec struct {
 	cipher *security.Cipher
 }
 
+// isGatewayCompactionItemType 判断输入项是否为压缩状态项。
+// 参数 itemType 为 Responses 输入项类型；返回值表示是否为 compaction 或 compaction_summary。
+// 两种类型都携带不透明 encrypted_content，不能按普通历史消息处理。
+func isGatewayCompactionItemType(itemType string) bool {
+	switch strings.TrimSpace(itemType) {
+	case "compaction", "compaction_summary":
+		return true
+	default:
+		return false
+	}
+}
+
 func newGatewayCompactionCodec(cipher *security.Cipher) *gatewayCompactionCodec {
 	if cipher == nil {
 		return nil
@@ -98,7 +110,7 @@ func expandGatewayCompactionHistory(body []byte, codec *gatewayCompactionCodec, 
 	changed := false
 	for index, raw := range items {
 		item, ok := raw.(map[string]any)
-		if !ok || stringField(item, "type") != "compaction" {
+		if !ok || !isGatewayCompactionItemType(stringField(item, "type")) {
 			continue
 		}
 		blob, _ := item["encrypted_content"].(string)

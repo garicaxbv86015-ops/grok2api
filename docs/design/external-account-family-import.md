@@ -26,7 +26,7 @@
 ## 接口契约
 
 - 路径：`POST /api/admin/v1/account-imports`
-- 鉴权：复用现有管理员鉴权。调用方先通过 `/api/admin/v1/auth/login` 使用管理员账号密码获取短期 `accessToken`，再以 Bearer Token 调用导入接口。
+- 鉴权：无需认证。该路由直接注册在公开管理 API 分组，调用方无需携带管理员 Bearer Token。
 - 请求体：
 
 ```json
@@ -100,15 +100,14 @@
 ## 错误规则
 
 - `400`：JSON 非法、`accounts` 为空或批次数量超限等整个请求错误。
-- `401 adminUnauthorized`：管理员访问令牌缺失或失效。
 - `500 accountFamilyImportFailed`：代理索引加载等批次级基础设施错误。
 - 批次被正常受理时 HTTP 状态为 `200`；单条校验或写入失败通过 `results[index].status = "failed"` 返回，其 `code` 可为 `invalid_credential`、`proxy_not_found`、`proxy_ambiguous`、`account_family_conflict` 或 `import_failed`。
 
 ## 决策日志
 
 - 决定采用单一同步批量接口，而不是让外部系统编排三个现有接口；原因是逻辑账号组和代理绑定必须由服务端保证一致性。
-- 决定复用管理员登录和 Bearer JWT，不增加独立导入密钥；原因是调用方明确要求直接使用管理员密码完成鉴权。
-- 决定管理员密码只提交给现有登录接口，不放入导入请求；原因是避免在每次导入和业务日志中重复暴露长期凭据。
+- 决定仅将 `POST /api/admin/v1/account-imports` 调整为无需认证，其他账号、代理和系统管理接口继续使用管理员 Bearer JWT；原因是调用方明确接受公开导入接口的风险，并要求避免短期 Token 过期影响自动化导入。
+- 已确认公开接口可能被任意可访问服务器的调用方提交数据；请求体大小、单批上限、凭据校验、代理匹配和单条事务仍作为业务边界保留。
 - 决定 `email` 作为逻辑账号名称但不作为唯一键；原因是 `sub` 更稳定，且邮箱可能变化或重复。
 - 决定 `priority` 等调度字段不进入接口；原因是它们属于本系统运行策略，导入时使用默认值即可。
 - 决定代理不存在时不自动创建；原因是代理资源必须先在“IP 管理”中受控维护。
@@ -116,7 +115,7 @@
 
 ## 验收标准
 
-- 外部系统能够使用管理员登录返回的 `accessToken` 调用导入接口。
+- 外部系统不携带管理员 Token 也能调用导入接口。
 - 成功导入后，逻辑账号名称等于请求中的 `email`。
 - Build、Web、Console 三条凭据属于同一个逻辑账号组。
 - 逻辑账号组绑定的代理与 `proxy_url` 对应的“IP 管理”代理一致。
@@ -126,7 +125,7 @@
 
 ## 实现验收记录
 
-- [x] 导入路由注册在现有管理端 Bearer 鉴权分组下。
+- [x] 仅导入路由注册在公开管理 API 分组下，其他管理接口仍由 Bearer 鉴权保护。
 - [x] `email` 写入 Build、Web、Console 三种成员的展示名。
 - [x] Build、Web、Console 在单个仓储事务内写入同一 `family_id`。
 - [x] `proxy_url` 仅在规范化后匹配 IP 管理中的启用代理，并绑定到逻辑账号组。

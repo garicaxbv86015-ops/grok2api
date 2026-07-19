@@ -35,7 +35,7 @@ func TestGatewayCompactionLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stream, contentType, err := buildGatewayCompactionResponse(sample.response, blob, "grok-4.5", true)
+	stream, contentType, err := buildGatewayCompactionResponse(sample.response, nil, blob, "grok-4.5", true)
 	if err != nil {
 		t.Fatal(err)
 	}

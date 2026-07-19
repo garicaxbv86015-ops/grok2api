@@ -26,8 +26,9 @@ var (
 )
 
 type gatewayCompactionSample struct {
-	response map[string]any
-	summary  string
+	response        map[string]any
+	summary         string
+	compactionItem  map[string]any
 }
 
 type gatewayCompactionStreamError struct {
@@ -109,6 +110,18 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 			}
 			return nil, err
 		}
+		// compaction 专用链路会在 Adapter 主流程之前返回，因此必须在这里单独处理
+		// 上游对历史密文或旧会话压缩状态的明确解码拒绝。
+		var reasoningRecovered bool
+		resp, reqURL, reasoningRecovered = a.recoverReasoningDecodeFailure(ctx, upstreamRequest, accessToken, body, base, resp, reqURL)
+		if reasoningRecovered {
+			warningHeader := make(http.Header)
+			if warnings != "" {
+				warningHeader.Set("X-Grok2API-Compatibility-Warnings", warnings)
+			}
+			appendCompatibilityWarning(warningHeader, "reasoning_encrypted_content_downgraded")
+			warnings = warningHeader.Get("X-Grok2API-Compatibility-Warnings")
+		}
 		modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
 		if !isHTTPSuccess(resp.StatusCode) {
 			result, transient, err := gatewayCompactionHTTPFailure(resp, reqURL, modelCatalogChanged, warnings)
@@ -134,7 +147,7 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "上游 compaction 响应超过 128 MiB"), nil
 		}
 		sample, sampleErr := parseGatewayCompactionStream(data)
-		if sampleErr == nil && isDegenerateGatewayCompactionSummary(sample.summary) {
+		if sampleErr == nil && sample.compactionItem == nil && isDegenerateGatewayCompactionSummary(sample.summary) {
 			sampleErr = errGatewayCompactionDegenerate
 		}
 		if sampleErr != nil {
@@ -146,11 +159,15 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 		}
 
 		continuation := gatewayCompactionContinuation(sample.summary)
-		blob, encodeErr := a.compaction.encode(request.PromptCacheKey, continuation)
-		if encodeErr != nil {
-			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 编码失败"), nil
+		var blob string
+		if sample.compactionItem == nil {
+			var encodeErr error
+			blob, encodeErr = a.compaction.encode(request.PromptCacheKey, continuation)
+			if encodeErr != nil {
+				return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 编码失败"), nil
+			}
 		}
-		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, blob, request.Model, request.Streaming)
+		converted, contentType, convertErr := buildGatewayCompactionResponse(sample.response, sample.compactionItem, blob, request.Model, request.Streaming)
 		if convertErr != nil {
 			return gatewayCompactionFailureProviderResponse(resp.Header, reqURL, modelCatalogChanged, warnings, "服务端 compaction 响应编码失败"), nil
 		}
@@ -173,6 +190,7 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 func parseGatewayCompactionStream(data []byte) (gatewayCompactionSample, error) {
 	var completed map[string]any
 	var streamedParts []string
+	var compactionItem map[string]any
 	err := consumeCompatibleSSE(io.NopCloser(bytes.NewReader(data)), func(event compatibleSSEEvent) error {
 		if !event.HasData() || bytes.Equal(bytes.TrimSpace(event.Data()), []byte("[DONE]")) {
 			return nil
@@ -188,6 +206,9 @@ func parseGatewayCompactionStream(data []byte) (gatewayCompactionSample, error) 
 		switch kind {
 		case "response.output_item.done":
 			if item, ok := payload["item"].(map[string]any); ok {
+				if isGatewayCompactionItemType(stringField(item, "type")) {
+					compactionItem = cloneJSONObject(item)
+				}
 				streamedParts = append(streamedParts, gatewayCompactionItemText(item)...)
 			}
 		case "response.completed":
@@ -220,10 +241,30 @@ func parseGatewayCompactionStream(data []byte) (gatewayCompactionSample, error) 
 		return gatewayCompactionSample{}, errGatewayCompactionStreamClosed
 	}
 	summary := extractCompactionSummary(completed)
+	if compactionItem == nil {
+		compactionItem = extractGatewayCompactionItem(completed)
+	}
 	if summary == "" {
 		summary = strings.Join(streamedParts, "\n")
 	}
-	return gatewayCompactionSample{response: completed, summary: summary}, nil
+	return gatewayCompactionSample{response: completed, summary: summary, compactionItem: compactionItem}, nil
+}
+
+// extractGatewayCompactionItem 从终态 Responses 中提取原生 compaction 项。
+// 参数 response 为上游 response 对象；返回值为深拷贝后的原生输入项，找不到时返回 nil。
+// 原生 encrypted_content 是只能逐字回传的不透明状态，不能通过窄结构体重建。
+func extractGatewayCompactionItem(response map[string]any) map[string]any {
+	if response == nil {
+		return nil
+	}
+	output, _ := response["output"].([]any)
+	for _, raw := range output {
+		item, ok := raw.(map[string]any)
+		if ok && isGatewayCompactionItemType(stringField(item, "type")) {
+			return cloneJSONObject(item)
+		}
+	}
+	return nil
 }
 
 func newGatewayCompactionStreamError(code, message string) error {
@@ -300,16 +341,25 @@ func extractCompactionSummary(response map[string]any) string {
 	return strings.Join(parts, "\n")
 }
 
-func buildGatewayCompactionResponse(response map[string]any, blob, model string, streaming bool) ([]byte, string, error) {
+// buildGatewayCompactionResponse 构造兼容 Responses 的压缩响应。
+// 参数 response 为上游终态、compactionItem 为上游原生压缩项、blob 为网关生成的兼容密文、
+// model 为对外模型名、streaming 表示是否输出 SSE；返回值依次为响应正文、Content-Type 和错误。
+// 当上游提供原生 compaction 项时必须优先逐字段保留，避免破坏 encrypted_content。
+func buildGatewayCompactionResponse(response map[string]any, compactionItem map[string]any, blob, model string, streaming bool) ([]byte, string, error) {
 	response = cloneJSONObject(response)
 	normalizeGatewayCompactionUsage(response)
 	responseID := strings.TrimSpace(stringField(response, "id"))
 	if responseID == "" {
 		responseID = "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	}
-	item := map[string]any{
-		"id":   "cmp_" + strings.TrimPrefix(responseID, "resp_"),
-		"type": "compaction", "encrypted_content": blob,
+	item := compactionItem
+	if item == nil {
+		item = map[string]any{
+			"id":   "cmp_" + strings.TrimPrefix(responseID, "resp_"),
+			"type": "compaction", "encrypted_content": blob,
+		}
+	} else {
+		item = cloneJSONObject(item)
 	}
 	response["id"] = responseID
 	response["object"] = "response"

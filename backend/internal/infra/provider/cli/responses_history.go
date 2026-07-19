@@ -52,7 +52,7 @@ func (c *responsesToolCompatibility) normalizeInputItems(items []any) ([]any, []
 			c.changed = true
 			rewritten = append(rewritten, converted)
 		case "file_search_call", "web_search_call", "image_generation_call", "code_interpreter_call",
-			"shell_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "mcp_call", "compaction":
+			"shell_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "mcp_call", "compaction", "compaction_summary":
 			// 这些类型已进入 Grok Build 0.2.103 的 Responses InputItem 契约。
 			// 仅清理 Codex 私有字段和 null，不能把原生调用降级成文本边界。
 			converted := sanitizeNativeHistoryInput(item, itemType)
@@ -309,7 +309,7 @@ func sanitizeNativeHistoryInput(item map[string]any, itemType string) map[string
 		fields = []string{"approval_request_id", "approve", "id", "reason"}
 	case "mcp_call":
 		fields = []string{"arguments", "id", "name", "server_label", "approval_request_id", "error", "output", "status"}
-	case "compaction":
+	case "compaction", "compaction_summary":
 		fields = []string{"id", "encrypted_content"}
 	}
 	converted := copyNonNullHistoryFields(item, fields...)

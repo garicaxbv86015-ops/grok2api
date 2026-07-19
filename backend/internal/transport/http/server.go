@@ -145,6 +145,7 @@ func New(deps Dependencies) *gin.Engine {
 	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies)
 	authHandler.RegisterPublic(adminRoot)
 	accountHandler := accounthttp.NewHandler(deps.Accounts, deps.AccountSync)
+	accountHandler.RegisterPublic(adminRoot)
 	adminProtected := adminRoot.Group("")
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))
 	authHandler.RegisterAuthenticated(adminProtected)

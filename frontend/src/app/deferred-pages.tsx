@@ -25,7 +25,7 @@ function DeferredPage({ page: Page }: { page: ComponentType }) {
 }
 
 export function DeferredAccountsPage() {
-  return <DeferredPage page={AccountsPage} />;
+	return <DeferredPage page={AccountsPage} />;
 }
 
 // DeferredAccountInspectionPage 延迟加载 Build 账号巡检工作台。

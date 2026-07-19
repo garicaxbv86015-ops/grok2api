@@ -737,7 +737,7 @@ export function AccountsPage() {
       </section>
       <div className="space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <Tabs value={logicalMode ? "logical" : provider} onValueChange={(value) => { if (value === "logical") { setLogicalMode(true); setSelected(new Set()); } else changeProvider(value as AccountProvider); }}>
+          <Tabs value={logicalMode ? "logical" : provider} onValueChange={(value) => { if (value === "logical") { setLogicalMode(true); clearSelection(); } else changeProvider(value as AccountProvider); }}>
             <TabsList>
               <TabsTrigger value="grok_build" className="gap-1.5">
                 <SquareTerminal className="size-3.5 text-quota-product-1" />
