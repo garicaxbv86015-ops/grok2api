@@ -3,6 +3,7 @@ import { lazy, Suspense, type ComponentType, type LazyExoticComponent } from "re
 import { Spinner } from "@/components/ui/spinner";
 
 const AccountsPage = lazyNamed(() => import("@/features/accounts/accounts-page"), "AccountsPage");
+const AccountInspectionPage = lazyNamed(() => import("@/features/account-inspection/inspection-page"), "AccountInspectionPage");
 const AppShell = lazyNamed(() => import("@/app/app-shell"), "AppShell");
 const RequestAuditsPage = lazyNamed(() => import("@/features/audits/request-audits-page"), "RequestAuditsPage");
 const ClientKeysPage = lazyNamed(() => import("@/features/client-keys/client-keys-page"), "ClientKeysPage");
@@ -25,6 +26,12 @@ function DeferredPage({ page: Page }: { page: ComponentType }) {
 
 export function DeferredAccountsPage() {
   return <DeferredPage page={AccountsPage} />;
+}
+
+// DeferredAccountInspectionPage 延迟加载 Build 账号巡检工作台。
+// 无参数；返回延迟加载后的巡检页面。
+export function DeferredAccountInspectionPage() {
+	return <DeferredPage page={AccountInspectionPage} />;
 }
 
 export function DeferredAppShell() {

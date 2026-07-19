@@ -8,6 +8,7 @@ import (
 
 	_ "github.com/chenyme/grok2api/backend/docs"
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
+	accountinspectionapp "github.com/chenyme/grok2api/backend/internal/application/accountinspection"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	adminauthapp "github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
@@ -21,6 +22,7 @@ import (
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
+	accountinspectionhttp "github.com/chenyme/grok2api/backend/internal/transport/http/accountinspection"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
 	clientkeyhttp "github.com/chenyme/grok2api/backend/internal/transport/http/clientkey"
@@ -53,6 +55,7 @@ type Dependencies struct {
 	TrafficReady func() bool
 	AdminAuth    *adminauthapp.Service
 	Accounts     *accountapp.Service
+	AccountInspection *accountinspectionapp.Service
 	AccountSync  *accountsyncapp.Service
 	Models       *modelapp.Service
 	ClientKeys   *clientkeyapp.Service
@@ -141,10 +144,12 @@ func New(deps Dependencies) *gin.Engine {
 	adminRoot := router.Group("/api/admin/v1")
 	authHandler := adminauthhttp.NewHandler(deps.AdminAuth, deps.SecureCookies)
 	authHandler.RegisterPublic(adminRoot)
+	accountHandler := accounthttp.NewHandler(deps.Accounts, deps.AccountSync)
 	adminProtected := adminRoot.Group("")
 	adminProtected.Use(middleware.AdminAuth(deps.AdminAuth))
 	authHandler.RegisterAuthenticated(adminProtected)
-	accounthttp.NewHandler(deps.Accounts, deps.AccountSync).Register(adminProtected)
+	accountHandler.Register(adminProtected)
+	accountinspectionhttp.NewHandler(deps.AccountInspection).Register(adminProtected)
 	modelhttp.NewHandler(deps.Models).Register(adminProtected)
 	clientkeyhttp.NewHandler(deps.ClientKeys).Register(adminProtected)
 	audithttp.NewHandler(deps.Audits).Register(adminProtected)

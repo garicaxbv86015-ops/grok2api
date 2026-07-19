@@ -131,6 +131,30 @@ type accountCredentialModel struct {
 
 func (accountCredentialModel) TableName() string { return "account_credentials" }
 
+// accountInspectionModel 保存 Build 账号最后一次可展示的巡检结论。
+type accountInspectionModel struct {
+	// AccountID 是 Build 账号主键，同时保证每个账号只保留一条最新快照。
+	AccountID uint64 `gorm:"primaryKey"`
+	// State 是账号可用性的巡检结论。
+	State string `gorm:"size:32;not null;check:chk_account_inspections_state,state IN ('healthy','unavailable','uncertain','skipped')"`
+	// Classification 是稳定的失败或成功分类。
+	Classification string `gorm:"size:64;not null;check:chk_account_inspections_classification,classification IN ('healthy','disabled','reauth_required','quota_exhausted','permission_denied','probe_model_unavailable','temporary_rate_limited','probe_error')"`
+	// Reason 是可安全展示的短原因，不包含上游原始响应或凭据。
+	Reason string `gorm:"size:512;not null;check:chk_account_inspections_reason,length(reason) <= 512"`
+	// HTTPStatus 是最近探测的上游 HTTP 状态，0 表示未获得响应。
+	HTTPStatus int `gorm:"not null;default:0;check:chk_account_inspections_http_status,http_status BETWEEN 0 AND 599"`
+	// Model 是最近探测使用的模型标识。
+	Model string `gorm:"size:128;not null;check:chk_account_inspections_model,length(trim(model)) BETWEEN 1 AND 128"`
+	// InspectedAt 是最近一次巡检完成的 UTC 时间。
+	InspectedAt time.Time `gorm:"not null"`
+	// Account 定义账号删除时级联删除巡检快照的关系。
+	Account *accountModel `gorm:"foreignKey:AccountID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:CASCADE"`
+}
+
+// TableName 返回账号巡检快照表名。
+// 无参数；返回数据库表名。
+func (accountInspectionModel) TableName() string { return "account_inspections" }
+
 type accountProviderLinkModel struct {
 	WebAccountID   uint64        `gorm:"primaryKey"`
 	BuildAccountID uint64        `gorm:"uniqueIndex;not null;check:chk_account_provider_links_distinct,web_account_id <> build_account_id"`
