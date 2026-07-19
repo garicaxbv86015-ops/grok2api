@@ -18,6 +18,7 @@ var schemaModels = []any{
 	&accountModel{},
 	&accountCredentialModel{},
 	&accountProviderLinkModel{},
+	&webConsoleAccountLinkModel{},
 	&webAccountProfileModel{},
 	&quotaWindowModel{},
 	&billingModel{},
@@ -117,11 +118,17 @@ autoMigrate := func() error {
 	if err := d.ensureConsoleConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 Console 数据库约束: %w", err)
 	}
+	if err := d.ensureAuditOperationConstraints(ctx); err != nil {
+		return fmt.Errorf("迁移请求审计操作约束: %w", err)
+	}
 	if err := d.ensureMediaJobConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media job 数据库约束: %w", err)
 	}
 	if err := d.ensureMediaAssetConstraints(ctx); err != nil {
 		return fmt.Errorf("迁移 media asset 数据库约束: %w", err)
+	}
+	if err := d.backfillWebEgressIdentities(ctx); err != nil {
+		return fmt.Errorf("迁移 Web 出口身份: %w", err)
 	}
 	for _, statement := range schemaIndexes {
 		if err := db.Exec(statement).Error; err != nil {
@@ -243,6 +250,14 @@ func (d *Database) ensureConsoleConstraints(ctx context.Context) error {
 		{model: &responseOwnershipModel{}, table: "response_ownership", name: "chk_response_ownership_provider"},
 		{model: &egressNodeModel{}, table: "egress_nodes", name: "chk_egress_nodes_specific_scope"},
 	}, "grok_console")
+}
+
+// ensureAuditOperationConstraints upgrades existing databases so Codex remote
+// compaction can be recorded separately from ordinary Responses requests.
+func (d *Database) ensureAuditOperationConstraints(ctx context.Context) error {
+	return d.ensureNamedConstraints(ctx, []consoleConstraint{
+		{model: &requestAuditModel{}, table: "request_audits", name: "chk_request_audits_operation"},
+	}, "compaction")
 }
 
 // ensureMediaJobConstraints 将历史仅允许 grok_web 的 media job CHECK 升级到支持 Build 视频。

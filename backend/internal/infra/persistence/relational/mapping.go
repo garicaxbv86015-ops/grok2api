@@ -66,10 +66,20 @@ func toAccountDomain(value accountModel) account.Credential {
 	var webTier account.WebTier
 	var webTierSyncedAt *time.Time
 	var webNSFWEnabledAt *time.Time
+	var webTermsAcceptedAt *time.Time
+	var webTermsAcceptedVersion int
+	var webBirthDateSetAt *time.Time
+	var egressIdentity string
 	if value.WebProfile != nil {
 		webTier = account.WebTier(value.WebProfile.Tier)
 		webTierSyncedAt = value.WebProfile.SyncedAt
 		webNSFWEnabledAt = value.WebProfile.NSFWEnabledAt
+		webTermsAcceptedVersion = value.WebProfile.TermsAcceptedVersion
+		if webTermsAcceptedVersion >= account.CurrentWebTermsVersion {
+			webTermsAcceptedAt = value.WebProfile.TermsAcceptedAt
+		}
+		webBirthDateSetAt = value.WebProfile.BirthDateSetAt
+		egressIdentity = value.WebProfile.EgressIdentity
 	}
 	buildRouteMode := account.BuildRouteMode(value.BuildRouteMode)
 	if account.Provider(value.Provider) != account.ProviderBuild || !buildRouteMode.IsValid() {
@@ -86,7 +96,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		MaxConcurrent: value.MaxConcurrent, MinimumRemaining: value.MinimumRemaining, FailureCount: value.FailureCount,
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
-		WebNSFWEnabledAt: webNSFWEnabledAt,
+		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -182,7 +192,7 @@ func fromWebProfileDomain(value account.Credential) *webAccountProfileModel {
 	if tier == "" {
 		tier = account.WebTierAuto
 	}
-	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt}
+	return &webAccountProfileModel{AccountID: value.ID, Tier: string(tier), SyncedAt: value.WebTierSyncedAt, NSFWEnabledAt: value.WebNSFWEnabledAt, TermsAcceptedAt: value.WebTermsAcceptedAt, TermsAcceptedVersion: value.WebTermsAcceptedVersion, BirthDateSetAt: value.WebBirthDateSetAt, EgressIdentity: value.EgressIdentity}
 }
 
 func accountIdentity(value account.Credential) string {

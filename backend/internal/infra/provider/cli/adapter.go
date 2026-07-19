@@ -218,7 +218,7 @@ func (a *Adapter) ForwardResponse(ctx context.Context, request provider.Response
 	if a.shouldCaptureReplay(request, resp) {
 		resp.Body = a.replay.CaptureBody(resp.Body, request.Model, request.PromptCacheKey, request.Streaming, isCompactPath(request.Path))
 	}
-	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses
+	responsesOperation := request.Operation == "" || request.Operation == conversation.OperationResponses || request.Operation == conversation.OperationCompaction
 	if responsesOperation && toolCompatibility != nil {
 		if warnings := toolCompatibility.warningHeader(); warnings != "" {
 			resp.Header.Set("X-Grok2API-Compatibility-Warnings", warnings)
@@ -721,7 +721,7 @@ func (a *Adapter) getBilling(ctx context.Context, credential account.Credential,
 
 func (a *Adapter) getSubscriptionTier(ctx context.Context, credential account.Credential, accessToken string) (string, error) {
 	endpoint := a.url("/user") + "?include=subscription"
-	requestCtx, cancel := context.WithTimeout(infraegress.WithAccount(ctx, string(account.ProviderBuild), credential.ID), subscriptionTierTimeout)
+	requestCtx, cancel := context.WithTimeout(infraegress.WithCredential(ctx, credential), subscriptionTierTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, endpoint, nil)
 	if err != nil {

@@ -39,13 +39,18 @@ func WithAccount(ctx context.Context, provider string, accountID uint64) context
 	return WithAccountIdentity(ctx, strings.TrimSpace(provider)+"_"+fmt.Sprintf("%d", accountID))
 }
 
-// WithCredential 将完整账号出口配置传递给 Build HTTP Transport。
+// WithCredential 将完整账号出口配置与稳定出口身份传给 Build HTTP Transport。
 // 参数 ctx 为请求上下文，credential 为账号凭据；返回携带非公开出口配置和稳定账号身份的上下文。
+// 若账号已设置 EgressIdentity（例如 Web/Console 共享 SSO），则优先使用该身份做粘性代理绑定。
 func WithCredential(ctx context.Context, credential accountdomain.Credential) context.Context {
 	if ctx == nil || credential.ID == 0 {
 		return ctx
 	}
 	ctx = context.WithValue(ctx, credentialContextKey{}, credential)
+	identity := strings.TrimSpace(credential.EgressIdentity)
+	if identity != "" {
+		return WithAccountIdentity(ctx, identity)
+	}
 	provider := credential.Provider
 	if provider == "" {
 		// CLI 单元测试及部分刷新路径只携带账号 ID；该上下文入口由 Build Transport 使用。

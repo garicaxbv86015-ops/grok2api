@@ -47,6 +47,7 @@ const (
 	credentialRefreshSafetyPoll time.Duration = time.Minute
 	credentialRefreshTimeout    time.Duration = 30 * time.Second
 	credentialRefreshStateTTL   time.Duration = 5 * time.Second
+	credentialStateWriteTimeout time.Duration = 5 * time.Second
 	credentialRefreshBatchSize                = 100
 	managedTaskWorkerCeiling                  = 50
 	webQuotaRefreshQueueSize                  = 4096
@@ -334,6 +335,7 @@ type Service struct {
 	refreshes             singleflight.Group
 	billingSyncs          singleflight.Group
 	quotaSyncs            singleflight.Group
+	identitySyncs         singleflight.Group
 	refreshMu             sync.Mutex
 	lastRefreshAt         map[uint64]time.Time
 	quotaRefreshMu        sync.Mutex
@@ -865,6 +867,7 @@ func (s *Service) PollDeviceLogin(ctx context.Context, sessionID string) (View, 
 	if err != nil {
 		return View{}, err
 	}
+	s.reconcileProviderLinksBestEffort(ctx, value.ID)
 	_ = s.deviceSessions.Delete(ctx, sessionID)
 	return s.Get(ctx, value.ID)
 }
@@ -1193,6 +1196,7 @@ func (s *Service) persistImportedSeeds(ctx context.Context, seeds []provider.Cre
 		}
 		for _, value := range stored {
 			result.AccountIDs = append(result.AccountIDs, value.ID)
+			s.reconcileProviderLinksBestEffort(ctx, value.ID)
 			if observer != nil {
 				if err := observer(value.ID); err != nil {
 					return ImportResult{}, err
@@ -1621,7 +1625,7 @@ func (s *Service) convertWebAccountToBuild(ctx context.Context, id uint64, strat
 	seed, err := converter.ConvertToBuild(ctx, value)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(context.WithoutCancel(ctx), id, "Grok Web SSO credential rejected")
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, "Grok Web SSO credential rejected"))
 		}
 		return 0, false, false, err
 	}
@@ -1834,6 +1838,21 @@ func (s *Service) MarkReauthRequired(ctx context.Context, id uint64, reason stri
 	}
 	if s.sticky != nil {
 		_ = s.sticky.DeleteByAccount(ctx, id)
+	}
+	return nil
+}
+
+// markSSOCredentialRejected 在上游明确返回 401 后可靠持久化失效状态。
+// 状态写入不继承客户端取消，避免已经确认失效的账号因请求断开继续留在号池。
+func (s *Service) markSSOCredentialRejected(ctx context.Context, value accountdomain.Credential, reason string) error {
+	if value.AuthType != accountdomain.AuthTypeSSO {
+		return nil
+	}
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credentialStateWriteTimeout)
+	defer cancel()
+	if err := s.MarkReauthRequired(writeCtx, value.ID, reason); err != nil {
+		s.logger.Error("account_reauth_required_write_failed", "account_id", value.ID, "provider", value.Provider, "error", err)
+		return err
 	}
 	return nil
 }
@@ -2283,7 +2302,7 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) ([]accountdomain.
 	snapshot, err := adapter.SyncQuota(ctx, value)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(ctx, id, fmt.Sprintf("%s SSO credential rejected", value.Provider))
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
 		return nil, err
 	}
@@ -2303,6 +2322,18 @@ func (s *Service) refreshQuota(ctx context.Context, id uint64) ([]accountdomain.
 			if err := s.quotaQueue.ScheduleQuotaRecovery(ctx, accountdomain.QuotaRecoveryEvent{AccountID: id, Mode: window.Mode, DueAt: *window.ResetAt}); err != nil {
 				return snapshot.Windows, fmt.Errorf("安排额度恢复事件: %w", err)
 			}
+		}
+	}
+	// 身份补全是非关键操作：只在额度落库和恢复任务调度完成后执行，
+	// 并沿用调用方取消语义，不能反向影响额度同步结果。
+	if (value.Provider == accountdomain.ProviderWeb || value.Provider == accountdomain.ProviderConsole) && ctx.Err() == nil {
+		if strings.TrimSpace(value.UserID) == "" && strings.TrimSpace(value.Email) == "" {
+			if identityErr := s.syncAccountIdentityBestEffort(ctx, id); errors.Is(identityErr, provider.ErrUnauthorized) {
+				return snapshot.Windows, identityErr
+			}
+		} else {
+			// 已有 Session 身份时只做本地增量关联，不再访问上游。
+			s.reconcileProviderLinksBestEffort(ctx, id)
 		}
 	}
 	return snapshot.Windows, nil
@@ -2379,7 +2410,7 @@ func (s *Service) refreshQuotaMode(ctx context.Context, id uint64, mode string) 
 	window, err := adapter.SyncQuotaMode(ctx, value, mode)
 	if err != nil {
 		if errors.Is(err, provider.ErrUnauthorized) {
-			_ = s.MarkReauthRequired(ctx, id, fmt.Sprintf("%s SSO credential rejected", value.Provider))
+			err = errors.Join(err, s.markSSOCredentialRejected(ctx, value, fmt.Sprintf("%s SSO credential rejected", value.Provider)))
 		}
 		return accountdomain.QuotaWindow{}, err
 	}
@@ -2782,6 +2813,9 @@ func (s *Service) credentialFromSeed(seed provider.CredentialSeed) (accountdomai
 		authType = definition.Credential.AuthType
 	}
 	value := accountdomain.Credential{FamilyID: seed.FamilyID, Provider: providerValue, AuthType: authType, WebTier: seed.WebTier, Name: seed.Name, Email: seed.Email, UserID: seed.UserID, TeamID: seed.TeamID, SourceKey: sourceKey, OIDCClientID: seed.OIDCClientID, EncryptedAccessToken: accessEncrypted, EncryptedRefreshToken: refreshEncrypted, EncryptedCloudflareCookie: cloudflareEncrypted, ExpiresAt: seed.ExpiresAt, Enabled: true, AuthStatus: accountdomain.AuthStatusActive, Priority: accountdomain.DefaultPriority, MaxConcurrent: accountdomain.DefaultMaxConcurrent, MinimumRemaining: accountdomain.DefaultMinimumRemaining}
+	if providerValue == accountdomain.ProviderWeb && strings.TrimSpace(seed.AccessToken) != "" {
+		value.EgressIdentity = "sso_" + security.HashToken(seed.AccessToken)[:32]
+	}
 	return value, nil
 }
 
