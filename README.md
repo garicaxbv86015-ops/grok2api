@@ -16,35 +16,31 @@
   <a href="https://github.com/chenyme/grok2api/pkgs/container/grok2api"><img alt="Docker" src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white" /></a>
 </p>
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/19868?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-19868" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/19868" alt="chenyme%2Fgrok2api | Trendshift" width="250" height="55"/></a>
-</p>
-
-> [!TIP]
-> Check out [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat), a lightweight, integrated AI platform for model routing, chat, files, tools, billing, identity, and operations.
+This project is a **secondary modification and enhancement** of [chenyme/grok2api](https://github.com/chenyme/grok2api).
 
 > [!NOTE]
-> This project is for technical research and learning purposes only. Please comply with Grok's official terms of use and local laws when using it; otherwise, you will be solely responsible for all consequences!
+> This project is for learning and research only. You must follow Grok's **Terms of Use** and applicable **laws and regulations**. Do not use it for illegal purposes.
 
-## Sponsors
-> [Want to sponsor this project?](mailto:chenyme03@gmail.com)
+Built on the upstream Go + React architecture, it keeps independent Build / Web / Console account pools, OpenAI- and Anthropic-compatible APIs, and the admin console, and adds **logical account families, IP management, external bulk import, Build account inspection, and response recovery** improvements.
 
-<table>
-<tr>
-<td width="200" align="center" valign="middle"><a href="https://github.com/DEEIX-AI/DEEIX-Chat"><img src="frontend/public/sponner/deeix-chat_deeix-ai.png" alt="DEEIX AI / DEEIX Chat" width="160"></a></td>
-<td valign="middle">DEEIX-Chat is an open-source, self-hostable AI Chat platform for individuals, teams, and enterprises that need stable, long-term, unified access to multiple models. It brings models, conversations, files, tool calling, and administration together in one deployable and extensible system. Click <a href="https://github.com/DEEIX-AI/DEEIX-Chat">here</a> to start deploying.</td>
-</tr>
-<tr>
-<td width="200" align="center" valign="middle"><a href="https://www.right.codes/register"><img src="frontend/public/sponner/rightcode.jpg" alt="RightCode" width="160"></a></td>
-<td valign="middle">Right Code is an enterprise-grade AI Agent distribution platform that primarily provides stable access services for Claude Code, Codex, Gemini, and other models. It supports invoicing and dedicated one-to-one assistance for enterprises and teams. Thanks to Right Code for providing token support. Click <a href="https://www.right.codes/register">here</a> to register and get started.</td>
-</tr>
-</table>
+## Enhancements in this fork
 
-<br>
+- **Logical account families**: Group Web / Build / Console credentials that share one login identity; manage members and egress identity together
+- **IP management**: Dedicated proxy resource page for reusable HTTP / HTTPS / SOCKS5 / SOCKS5H proxies, with connection tests, enable/disable, and reference counts
+- **Family-level proxy binding**: Each logical family binds at most one fixed proxy shared by all three Providers; bound proxies fail closed (no auto IP switch or direct fallback)
+- **Batch proxy binding**: Select families on the current page and bind / switch / unbind proxies in a single transaction
+- **External account import**: `POST /api/admin/v1/account-imports` imports email, Build OAuth, Web/Console SSO, and proxy binding as one atomic per-row operation
+- **Family deletion**: Atomically delete a family and all Provider members plus related runtime state; reusable proxies and generated media assets are retained
+- **Build inspection workbench**: Admin console workbench that classifies Build accounts and surfaces inspection results
+- **Response recovery improvements**: Stronger Build-side reasoning recovery and compaction forwarding for multi-turn / compact stability
 
-Grok2API is a Go-based Grok API gateway with a built-in React admin console. It organizes Grok Build OAuth, Grok Web SSO, and Grok Console SSO credentials into independent account pools, exposes OpenAI- and Anthropic-style APIs, and provides one place to manage model routes, client keys, quotas, media, audits, and egress proxies.
+Design docs:
 
-## Highlights
+- [Account family proxy binding](./docs/design/account-family-proxy-binding.md)
+- [Account family deletion](./docs/design/account-family-deletion.md)
+- [External account family import](./docs/design/external-account-family-import.md)
+
+## Highlights (including upstream)
 
 - **Three Providers**: Build, Web, and Console keep credentials, quotas, health, cooldowns, concurrency, and model capabilities separate
 - **Compatible APIs**: Responses, Chat Completions, Anthropic Messages, Images, and asynchronous Videos
@@ -52,9 +48,9 @@ Grok2API is a Go-based Grok API gateway with a built-in React admin console. It 
 - **Multi-account scheduling**: priorities, quota gates, sticky sessions, concurrency leases, cooldowns, and bounded failover
 - **Multi-turn compatibility**: stored-response ownership, compaction, and optional server-side reasoning replay
 - **Media pipeline**: image generation, image editing, video jobs, local archiving, and URL/Base64/SSE output
-- **Account relationships**: Web-centered links to Build and Console can share a stable egress identity while runtime state stays independent
+- **Account relationships & families**: cross-Provider weak links plus this fork's logical families and family-level proxies
 - **Runtime infrastructure**: SQLite/PostgreSQL, Memory/Redis, and HTTP/SOCKS5/Resin egress
-- **Admin console**: dashboard, accounts, model routes, client keys, image gallery, video library, request audits, runtime settings, and update checks
+- **Admin console**: dashboard, accounts, logical families, IP management, model routes, client keys, media libraries, audits, Build inspection, runtime settings, and update checks
 
 ## Architecture
 
@@ -80,6 +76,7 @@ flowchart TB
     Web --> Egress
     Console --> Egress
     App --> Media["Media Storage"]
+    App --> Family["Account Family + Proxy"]
 ```
 
 Requests never mix account state across Providers:
@@ -88,7 +85,7 @@ Requests never mix account state across Providers:
 2. The model router resolves a public model name to a Provider-qualified internal route.
 3. The Provider Registry verifies that the selected source supports the requested protocol or media operation.
 4. The account selector chooses an eligible account from that Provider using capability, quota, stickiness, cooldown, and concurrency state.
-5. The matching Adapter performs upstream protocol conversion and forwarding.
+5. The matching Adapter performs upstream protocol conversion and forwarding; if the logical family has a bound proxy, egress uses that proxy strictly.
 6. Audit, quota, billing, response ownership, and concurrency leases are finalized once at the end of the request.
 
 ### Provider boundaries
@@ -98,14 +95,6 @@ Requests never mix account state across Providers:
 | Grok Build | OAuth / Device OAuth | Discovered per account | Billing | Responses, Chat, Messages, Compact, stored responses, Video |
 | Grok Web | SSO | Built in and filtered by account tier | Upstream quota windows | Responses, Chat, Messages, Images, Image Edit, Video |
 | Grok Console | SSO | Built in | Local window | Stateless Responses, Chat, Messages |
-
-Providers are integrated through focused capability interfaces. Generic Gateway and HTTP Handler code does not construct private Provider requests. The dependency direction remains:
-
-```text
-Transport → Application → Domain
-                 ↑
-       Infrastructure adapters
-```
 
 ### Technology stack
 
@@ -130,16 +119,15 @@ frontend/
   src/features/         Feature-oriented pages and interactions
   src/entities/         Shared domain objects
   src/shared/           API client, auth, components, and utilities
+docs/design/            Design notes for fork enhancements
 ```
 
 ## Quick start
 
 ### Docker Compose (recommended)
 
-Official GHCR images are published for both `linux/amd64` and `linux/arm64`.
-
 ```bash
-git clone https://github.com/chenyme/grok2api.git
+git clone <your-fork-url>
 cd grok2api
 cp config.example.yaml config.yaml
 ```
@@ -173,15 +161,6 @@ docker compose logs -f grok2api
 
 The admin console is available at `http://127.0.0.1:8000` by default.
 
-Compose mounts `config.yaml` read-only and stores the SQLite database and local media in the `grok2api-data` volume. The image already contains the frontend; no separate web deployment is required.
-
-Common maintenance commands:
-
-```bash
-docker compose restart grok2api
-docker compose down
-```
-
 ### Run from source
 
 ```bash
@@ -202,19 +181,19 @@ The frontend runs at `http://127.0.0.1:5173` by default and proxies API requests
 ## First-time setup
 
 1. Sign in with the administrator created from `bootstrapAdmin`.
-2. Add a Build, Web, or Console account under **Upstream Accounts**.
-3. Wait for the initial quota and model-capability sync to complete.
-4. Review public model names, sources, and enabled routes under **Model Routes**.
-5. Create a `g2a_` API key under **Client Keys**.
-6. Use that key to call `/v1/*`.
+2. Optionally create proxy resources under **IP Management**.
+3. Add Build, Web, or Console accounts under **Upstream Accounts**, or bulk-import logical families via the external import API.
+4. Optionally bind / batch-bind family-level proxies under **Logical Accounts**.
+5. Wait for the initial quota and model-capability sync to complete.
+6. Review public model names, sources, and enabled routes under **Model Routes**.
+7. Create a `g2a_` API key under **Client Keys**.
+8. Use that key to call `/v1/*`.
 
 After the administrator has been created, change its password and remove `bootstrapAdmin` from the configuration. Keep `credentialEncryptionKey` permanently: changing it makes existing encrypted credentials unreadable.
 
 ## Models and routing
 
-Public model names are unqualified by default. Internally, `Build/`, `Web/`, and `Console/` are used as stable route IDs. Qualified names remain available for explicitly selecting a source, but they are not shown as ordinary model names.
-
-Build models are discovered from the real capabilities of each account, so the project does not maintain a fixed list that quickly becomes stale. The admin console stores the last successful capability snapshot for every account, and the public catalog is the union of currently serviceable account capabilities. Always use the model page or this endpoint as the source of truth:
+Public model names are unqualified by default. Internally, `Build/`, `Web/`, and `Console/` are used as stable route IDs. Always use the model page or this endpoint as the source of truth:
 
 ```http
 GET /v1/models
@@ -244,15 +223,13 @@ GET /v1/models
 | `grok-4.20-multi-agent-0309` | Multi-agent variant |
 | `grok-build-0.1` | Build-family model |
 
-Console also exposes compatibility and reasoning-effort aliases such as `grok-4.3-low`, `grok-4.3-medium`, `grok-4.3-high`, and `grok-4.20-multi-agent-xhigh`. Console is stateless and does not support `previous_response_id`, Response retrieval/deletion, or compact.
+Console also exposes compatibility and reasoning-effort aliases. Console is stateless and does not support `previous_response_id`, Response retrieval/deletion, or compact.
 
-Build models such as `grok-4.5` come from the dynamic account catalog and are not part of the Console static catalog.
-
-The same public model can be exposed by multiple sources. Routing first selects a source that satisfies client permissions and protocol capabilities; subsequent account failover stays within that Provider pool and never migrates quota, cooldown, or multi-turn state to another Provider.
+Build models are discovered from account capabilities and are not part of the Console static catalog.
 
 ## API
 
-Client inference endpoints require an API key. Health checks, media reads with unguessable asset IDs, and one-time upload tickets use separate authorization boundaries:
+Client inference endpoints require an API key:
 
 ```http
 Authorization: Bearer g2a_xxx_xxx
@@ -278,7 +255,17 @@ Authorization: Bearer g2a_xxx_xxx
 | `GET` | `/v1/media/videos/{asset_id}` | Read an archived video |
 | `PUT` | `/v1/media/uploads/{token}` | Receive a video through a one-time upload ticket |
 
-Stored responses and compact are available only when the selected Provider supports them. Signed-in administrators can open `/docs` for the active base URL, current models, and request examples. Swagger is registered at `/swagger/index.html` only when `server.swaggerEnabled: true`.
+### Admin enhancements in this fork
+
+| Method | Path | Description |
+| :-- | :-- | :-- |
+| `GET/POST/PATCH/DELETE` | `/api/admin/v1/proxies` | IP / proxy resource management |
+| `POST` | `/api/admin/v1/proxies/:id/test` | Test a proxy connection |
+| `GET` | `/api/admin/v1/account-families` | List logical account families |
+| `PUT` | `/api/admin/v1/account-families/:id/proxy` | Bind / switch / unbind a family proxy |
+| `POST` | `/api/admin/v1/account-families/batch/proxy` | Batch-bind proxies for selected families |
+| `DELETE` | `/api/admin/v1/account-families/:id` | Delete a logical family |
+| `POST` | `/api/admin/v1/account-imports` | Bulk-import logical families from an external system |
 
 Minimal request example:
 
@@ -310,34 +297,26 @@ curl http://127.0.0.1:8000/v1/responses \
 | `media` | Media storage driver and path |
 | `routing` | Server-side multi-turn replay cache |
 
-Provider settings, service capacity, batch concurrency, model routes, media, audits, and egress proxies are managed from the admin console. Settings that are not explicitly marked as restart-required are hot-reloaded.
-
 | Deployment | Database | Runtime store | Media |
 | :-- | :-- | :-- | :-- |
 | Single instance | SQLite | Memory | Local directory |
 | Multiple instances | PostgreSQL | Redis | Shared volume or instance affinity |
 
-The relational database stores accounts, credentials, models, quotas, client keys, audits, and media metadata. Redis coordinates distributed rate limits, concurrency leases, sticky sessions, locks, quota recovery, and multi-instance setting notifications; it does not replace the relational database.
+### Account scheduling and logical families
 
-### Account scheduling and cross-Provider links
-
-- A sticky-session hit prefers the account already bound to the conversation. If that account is temporarily full, the selector waits briefly before borrowing another eligible account according to policy.
-- Without a valid binding, the selector combines priority, model capability, quota, concurrency, and last-selected time.
-- Web accounts can form one-to-one weak links with corresponding Build and Console accounts.
-- A link shares only an anonymous egress identity and management-page provenance. Credentials, quotas, availability, cooldowns, concurrency, model capabilities, and billing remain independent.
+- A sticky-session hit prefers the account already bound to the conversation. If that account is temporarily full, the selector waits briefly before borrowing another eligible account.
+- Web accounts can form one-to-one weak links with corresponding Build and Console accounts; this fork further unifies members and proxy binding through logical families.
+- When a family has a bound proxy, all three Providers share that egress endpoint; binding failures fail the request.
+- Unbound families continue to use the existing Provider-scoped egress node pools (including Resin `{account}` placeholders).
 - Email addresses are used only for display and search, never as proxy identities.
 
 ### Resin sticky proxies
-
-Proxy usernames support the `{account}` placeholder:
 
 ```text
 socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
 ```
 
-At runtime, the placeholder is replaced with a stable anonymous account identity. Linked Web, Build, and Console accounts can reuse the same identity; unlinked accounts continue to use their own fallback identities. Token refreshes do not rotate a persisted identity.
-
-The egress layer retries only connection errors that clearly occur before a request is submitted. Submitted generation requests, authentication failures, exhausted quotas, and upstream rate limits are never automatically replayed at the egress layer.
+At runtime, `{account}` is replaced with a stable anonymous account identity. Linked / same-family accounts can reuse the same identity.
 
 ## Security and production guidance
 
@@ -348,8 +327,7 @@ The egress layer retries only connection errors that clearly occur before a requ
 - Use PostgreSQL and Redis for multi-instance deployments, plus shared media storage or instance affinity
 - Back up `config.yaml`, the relational database, and the media directory
 - Place a reverse proxy, access controls, and basic network protections in front of public deployments
-
-Credentials are encrypted at rest, while client keys, logs, remote-resource downloads, and request/response bodies have explicit security boundaries. Public documentation focuses on stable capabilities, deployment, and operational behavior.
+- The external import endpoint has a large attack surface — restrict network access in production
 
 ## Development and verification
 
@@ -383,3 +361,4 @@ make swagger
 - [简体中文 README](./README.zh-CN.md)
 - [Backend guide](./backend/README.md)
 - [Frontend guide](./frontend/README.md)
+- [Upstream chenyme/grok2api](https://github.com/chenyme/grok2api)
