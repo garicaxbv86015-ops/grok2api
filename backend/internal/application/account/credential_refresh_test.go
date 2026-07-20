@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -61,6 +64,72 @@ func TestEnsureCredentialReusesRotatedTokenAndThrottlesForcedRefresh(t *testing.
 	}
 	if adapter.refreshCount.Load() != 3 || manual.EncryptedAccessToken != "access-3" {
 		t.Fatalf("manual refresh did not bypass cooldown: count = %d", adapter.refreshCount.Load())
+	}
+}
+
+// TestRefreshBillingProbesUnknownAccountBeforeBilling 验证未知账号先探测模型再请求 Billing。
+func TestRefreshBillingProbesUnknownAccountBeforeBilling(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	adapter.probeResponseModel = "grok-4.5-build-free"
+	adapter.billing = accountdomain.Billing{IsUnifiedBillingUser: true}
+
+	if _, err := service.RefreshBilling(context.Background(), credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.probeCount.Load() != 1 {
+		t.Fatalf("probe count = %d", adapter.probeCount.Load())
+	}
+	if adapter.probeRequest.Method != http.MethodPost || adapter.probeRequest.Path != "/responses" || adapter.probeRequest.Model != "grok-4.5" || !strings.Contains(string(adapter.probeRequest.Body), `"max_output_tokens":1`) {
+		t.Fatalf("probe request = %#v", adapter.probeRequest)
+	}
+	if adapter.billingObservedModel != "grok-4.5-build-free" {
+		t.Fatalf("billing ran before model probe: observed model = %q", adapter.billingObservedModel)
+	}
+	stored, err := service.accounts.Get(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.ObservedModel != "grok-4.5-build-free" {
+		t.Fatalf("observed model = %q", stored.ObservedModel)
+	}
+	storedBilling, err := service.accounts.GetBilling(context.Background(), credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedBilling.AccountID != credential.ID || !storedBilling.IsUnifiedBillingUser {
+		t.Fatalf("saved billing = %#v", storedBilling)
+	}
+}
+
+// TestRefreshBillingSkipsProbeWhenQuotaTypeIsKnown 验证已识别账号不会重复探测模型。
+func TestRefreshBillingSkipsProbeWhenQuotaTypeIsKnown(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	adapter.probeResponseModel = "grok-4.5-build-free"
+	if err := service.accounts.SaveBilling(context.Background(), accountdomain.Billing{AccountID: credential.ID, PlanName: "Free", IsUnifiedBillingUser: true, SyncedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.RefreshBilling(context.Background(), credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.probeCount.Load() != 0 {
+		t.Fatalf("known quota unexpectedly triggered probe: %d", adapter.probeCount.Load())
+	}
+}
+
+// TestRefreshBillingContinuesWhenModelProbeFails 验证探测失败时仍继续同步 Billing。
+func TestRefreshBillingContinuesWhenModelProbeFails(t *testing.T) {
+	now := time.Date(2026, 7, 11, 12, 0, 0, 0, time.UTC)
+	service, credential, adapter := newCredentialRefreshTestService(t, now)
+	adapter.billing = accountdomain.Billing{IsUnifiedBillingUser: true}
+
+	if _, err := service.RefreshBilling(context.Background(), credential.ID); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.probeCount.Load() != 1 || adapter.billingCount.Load() != 1 {
+		t.Fatalf("probe count = %d, billing count = %d", adapter.probeCount.Load(), adapter.billingCount.Load())
 	}
 }
 
@@ -549,11 +618,15 @@ func newCredentialRefreshTestService(t *testing.T, now time.Time) (*Service, acc
 type credentialRefreshAdapter struct {
 	refreshCount atomic.Int64
 	billingCount atomic.Int64
+	probeCount   atomic.Int64
 	delay        time.Duration
 	billingDelay time.Duration
 	billing      accountdomain.Billing
 	billingErr   error
 	refreshErr   error
+	probeResponseModel   string
+	billingObservedModel string
+	probeRequest          provider.ResponseResourceRequest
 }
 
 func (a *credentialRefreshAdapter) Provider() accountdomain.Provider {
@@ -586,19 +659,29 @@ func (a *credentialRefreshAdapter) RefreshCredential(ctx context.Context, _ acco
 	return provider.RefreshedCredential{EncryptedAccessToken: fmt.Sprintf("access-%d", count), EncryptedRefreshToken: fmt.Sprintf("refresh-%d", count), ExpiresAt: time.Now().UTC().Add(time.Hour)}, nil
 }
 
-func (a *credentialRefreshAdapter) ForwardResponse(context.Context, provider.ResponseResourceRequest) (*provider.Response, error) {
-	return nil, nil
+// ForwardResponse 返回可控的模型探测响应，供额度同步顺序测试使用。
+// 参数 request 为模型请求；返回模拟上游响应和错误。
+func (a *credentialRefreshAdapter) ForwardResponse(_ context.Context, request provider.ResponseResourceRequest) (*provider.Response, error) {
+	a.probeCount.Add(1)
+	a.probeRequest = request
+	if a.probeResponseModel == "" {
+		return nil, nil
+	}
+	return &provider.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"model":%q}`, a.probeResponseModel)))}, nil
 }
 
 func (a *credentialRefreshAdapter) ListModels(context.Context, accountdomain.Credential) ([]string, error) {
 	return nil, nil
 }
 
-func (a *credentialRefreshAdapter) GetBilling(context.Context, accountdomain.Credential) (accountdomain.Billing, error) {
+// GetBilling 返回测试用 Billing，并记录调用时账号是否已完成模型识别。
+// 参数 credential 为待同步账号；返回测试 Billing 快照和错误。
+func (a *credentialRefreshAdapter) GetBilling(_ context.Context, credential accountdomain.Credential) (accountdomain.Billing, error) {
 	if a.billingDelay > 0 {
 		time.Sleep(a.billingDelay)
 	}
 	a.billingCount.Add(1)
+	a.billingObservedModel = credential.ObservedModel
 	return a.billing, a.billingErr
 }
 

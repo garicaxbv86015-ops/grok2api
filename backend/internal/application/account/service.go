@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/mail"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -2211,6 +2213,8 @@ func credentialRefreshBackoff(accountID uint64, failureCount int, retryAfter tim
 	return delay + time.Duration((accountID*37)%16)*time.Second
 }
 
+// RefreshBilling 刷新账号 Billing；未知账号会先执行一次模型探测再读取额度。
+// 参数 ctx 为请求上下文，id 为账号标识；返回最新 Billing 快照和错误。
 func (s *Service) RefreshBilling(ctx context.Context, id uint64) (accountdomain.Billing, error) {
 	result, err, _ := s.billingSyncs.Do(strconv.FormatUint(id, 10), func() (any, error) {
 		return s.refreshBilling(ctx, id)
@@ -2225,8 +2229,36 @@ func (s *Service) RefreshBilling(ctx context.Context, id uint64) (accountdomain.
 	return billing, nil
 }
 
+// refreshBilling 编排凭据准备、未知账号模型探测、Billing 请求和付费额度恢复状态。
+// 参数 ctx 为请求上下文，id 为账号标识；返回最新 Billing 快照和错误。
 func (s *Service) refreshBilling(ctx context.Context, id uint64) (accountdomain.Billing, error) {
-	value, billing, err := s.fetchAndSaveBilling(ctx, id)
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return accountdomain.Billing{}, mapRepositoryError(err)
+	}
+	value, err = s.EnsureCredential(ctx, value, false)
+	if err != nil {
+		return accountdomain.Billing{}, err
+	}
+	if shouldProbe, probeCheckErr := s.shouldProbeAccountModel(ctx, value); probeCheckErr != nil {
+		s.logger.Warn("account_model_probe_check_failed", "account_id", id, "error", probeCheckErr)
+	} else if shouldProbe {
+		model, probeErr := s.probeAccountModel(ctx, value)
+		if probeErr != nil {
+			// 模型探测只用于补齐 Free/未知识别；探测失败不能阻断后续 Billing 同步。
+			s.logger.Warn("account_model_probe_failed", "account_id", id, "error", probeErr)
+		} else {
+			observedAt := s.now()
+			if err := s.accounts.UpdateObservedModel(ctx, id, model, observedAt); err != nil {
+				// 识别结果落库失败不应阻断同一次操作后续的 Billing 请求。
+				s.logger.Warn("account_observed_model_write_failed", "account_id", id, "error", err)
+			} else {
+				value.ObservedModel = model
+				value.ObservedModelAt = &observedAt
+			}
+		}
+	}
+	billing, err := s.fetchAndSaveBillingForCredential(ctx, id, value)
 	if err != nil {
 		return accountdomain.Billing{}, err
 	}
@@ -2236,6 +2268,8 @@ func (s *Service) refreshBilling(ctx context.Context, id uint64) (accountdomain.
 	return billing, nil
 }
 
+// fetchAndSaveBilling 读取账号并准备凭据后请求和保存 Billing 快照。
+// 参数 ctx 为请求上下文，id 为账号标识；返回账号、Billing 快照和错误。
 func (s *Service) fetchAndSaveBilling(ctx context.Context, id uint64) (accountdomain.Credential, accountdomain.Billing, error) {
 	value, err := s.accounts.Get(ctx, id)
 	if err != nil {
@@ -2245,6 +2279,12 @@ func (s *Service) fetchAndSaveBilling(ctx context.Context, id uint64) (accountdo
 	if err != nil {
 		return accountdomain.Credential{}, accountdomain.Billing{}, err
 	}
+	return s.fetchAndSaveBillingForCredential(ctx, id, value)
+}
+
+// fetchAndSaveBillingForCredential 使用已准备好的凭据请求并保存 Billing 快照。
+// 参数 ctx 为请求上下文，id 为账号标识，value 为已完成凭据检查的账号；返回账号、Billing 快照和错误。
+func (s *Service) fetchAndSaveBillingForCredential(ctx context.Context, id uint64, value accountdomain.Credential) (accountdomain.Credential, accountdomain.Billing, error) {
 	adapter, ok := s.providers.Billing(value.Provider)
 	if !ok {
 		return accountdomain.Credential{}, accountdomain.Billing{}, fmt.Errorf("Provider %s 未注册", value.Provider)
@@ -2258,6 +2298,103 @@ func (s *Service) fetchAndSaveBilling(ctx context.Context, id uint64) (accountdo
 		return accountdomain.Credential{}, accountdomain.Billing{}, err
 	}
 	return value, billing, nil
+}
+
+// shouldProbeAccountModel 判断账号是否缺少类型和额度识别所需的上游信号。
+// 参数 ctx 为请求上下文，value 为账号凭据；返回是否需要模型探测和检查错误。
+func (s *Service) shouldProbeAccountModel(ctx context.Context, value accountdomain.Credential) (bool, error) {
+	var billing *accountdomain.Billing
+	if snapshot, err := s.accounts.GetBilling(ctx, value.ID); err == nil {
+		billing = &snapshot
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return false, err
+	}
+	var recovery *accountdomain.QuotaRecovery
+	if snapshot, err := s.accounts.GetQuotaRecovery(ctx, value.ID); err == nil {
+		recovery = &snapshot
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return false, err
+	}
+	quota := newQuotaView(billing, 0, recovery, value.ObservedModel, value.BuildSuperEntitled && value.Provider == accountdomain.ProviderBuild)
+	return quota.Type == QuotaTypeUnknown, nil
+}
+
+// probeAccountModel 发送一次最小 Responses 请求，读取上游实际返回的模型名称。
+// 参数 ctx 为请求上下文，value 为已完成凭据检查的账号；返回上游模型名称和错误。
+func (s *Service) probeAccountModel(ctx context.Context, value accountdomain.Credential) (string, error) {
+	adapter, ok := s.providers.Responses(value.Provider)
+	if !ok {
+		return "", fmt.Errorf("Provider %s 未注册 Responses 探测能力", value.Provider)
+	}
+	body, err := json.Marshal(map[string]any{
+		"model":            "grok-4.5",
+		"input":            "Reply with OK.",
+		"stream":           false,
+		"max_output_tokens": 1,
+	})
+	if err != nil {
+		return "", fmt.Errorf("编码模型探测请求: %w", err)
+	}
+	response, err := adapter.ForwardResponse(ctx, provider.ResponseResourceRequest{
+		Credential: value, Method: http.MethodPost, Path: "/responses", Body: body,
+		Model: "grok-4.5", Operation: "responses",
+	})
+	if err != nil {
+		return "", err
+	}
+	if response == nil || response.Body == nil {
+		return "", errors.New("模型探测未返回响应体")
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, provider.MaxDiagnosticBodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("读取模型探测响应: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("模型探测返回 %d", response.StatusCode)
+	}
+	model := parseProbeResponseModel(data)
+	if model == "" {
+		return "", errors.New("模型探测响应缺少模型名称")
+	}
+	return model, nil
+}
+
+// parseProbeResponseModel 从 JSON 或 SSE 模型响应中提取实际模型名称。
+// 参数 data 为上游响应体；返回规范化模型名称，未找到时返回空字符串。
+func parseProbeResponseModel(data []byte) string {
+	parse := func(value []byte) string {
+		var payload struct {
+			Model    string `json:"model"`
+			Response struct {
+				Model string `json:"model"`
+			} `json:"response"`
+		}
+		if err := json.Unmarshal(value, &payload); err != nil {
+			return ""
+		}
+		if model := strings.TrimSpace(payload.Model); model != "" {
+			return model
+		}
+		return strings.TrimSpace(payload.Response.Model)
+	}
+	if model := parse(data); model != "" {
+		return model
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if line == "" || line == "[DONE]" {
+			continue
+		}
+		if model := parse([]byte(line)); model != "" {
+			return model
+		}
+	}
+	return ""
 }
 
 // ProbePaidQuota 在真实账期到期后执行一次 Billing 探测，不消耗模型额度。

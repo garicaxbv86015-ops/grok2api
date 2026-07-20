@@ -103,3 +103,16 @@ func TestNewQuotaViewBuildSuperEntitlementOverridesFreeSignals(t *testing.T) {
 		t.Fatalf("paid billing must win: %#v", quota)
 	}
 }
+
+// TestParseProbeResponseModelSupportsJSONAndSSE 验证模型探测响应的 JSON 和 SSE 解析。
+func TestParseProbeResponseModelSupportsJSONAndSSE(t *testing.T) {
+	if got := parseProbeResponseModel([]byte(`{"model":"grok-4.5-build-free"}`)); got != "grok-4.5-build-free" {
+		t.Fatalf("JSON model = %q", got)
+	}
+	if got := parseProbeResponseModel([]byte("event: response.created\ndata: {\"model\":\"grok-4.5-build-free\"}\n\n")); got != "grok-4.5-build-free" {
+		t.Fatalf("SSE model = %q", got)
+	}
+	if got := parseProbeResponseModel([]byte("data: {\"type\":\"response.created\",\"response\":{\"model\":\"grok-4.5-build-free\"}}\n")); got != "grok-4.5-build-free" {
+		t.Fatalf("nested SSE model = %q", got)
+	}
+}
