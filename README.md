@@ -51,6 +51,7 @@ Design docs:
 - **Account relationships & families**: cross-Provider weak links plus this fork's logical families and family-level proxies
 - **Runtime infrastructure**: SQLite/PostgreSQL, Memory/Redis, and HTTP/SOCKS5/Resin egress
 - **Admin console**: dashboard, accounts, logical families, IP management, model routes, client keys, media libraries, audits, Build inspection, runtime settings, and update checks
+- **Optional account auto-clean** (off by default): runtime settings can periodically hard-delete accounts already marked `reauthRequired` whose `reauth_marked_at` exceeds the configured minimum age. Cooldown-only and still-active permanent-refresh drain accounts are never selected. Accounts with active inference leases or queued/in-progress video jobs are skipped. A distributed maintenance lock prevents duplicate work across shared-runtime instances, and each tick has a bounded deletion budget. First scan waits one interval after enable and after process start; only actual policy changes reschedule the next tick.
 
 ## Architecture
 
@@ -309,6 +310,18 @@ curl http://127.0.0.1:8000/v1/responses \
 - When a family has a bound proxy, all three Providers share that egress endpoint; binding failures fail the request.
 - Unbound families continue to use the existing Provider-scoped egress node pools (including Resin `{account}` placeholders).
 - Email addresses are used only for display and search, never as proxy identities.
+
+### Managed FlareSolverr clearance
+
+To automatically maintain Grok Web Cloudflare Clearance, start the optional FlareSolverr Compose service:
+
+```bash
+docker compose --profile flaresolverr up -d
+# or
+podman compose --profile flaresolverr up -d
+```
+
+Then open **Runtime Settings → Media & Network → Clearance**, select `FlareSolverr`, and use `http://flaresolverr:8191` as the solver URL. FlareSolverr is not published on the host; each Web or Console egress node uses its own proxy to obtain cookies and User-Agent.
 
 ### Resin sticky proxies
 

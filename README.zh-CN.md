@@ -51,6 +51,7 @@
 - **账号关联与逻辑账号组**：跨 Provider 弱关联 + 本仓库逻辑账号组与组级代理
 - **运行基础设施**：SQLite/PostgreSQL、Memory/Redis、HTTP/SOCKS5/Resin 出口
 - **管理后台**：Dashboard、账号、逻辑账号、IP 管理、模型、密钥、图库、视频库、请求审计、Build 巡检、运行设置和版本检查
+- **可选账号自动清理**（默认关闭）：运行设置可按间隔硬删除已标记 `reauthRequired` 且 `reauth_marked_at` 超过最短保留时长的账号。不会选中纯冷却账号，也不会打断仍可 drain 的永久 refresh 账号；仍有推理租约或排队中/进行中视频任务的账号会被跳过。共享运行态下使用分布式维护锁避免多实例重复执行，每次 tick 采用有限删除预算。启用后与进程启动后的首次扫描均等待一个间隔，且只有清理策略实际变化时才重排下一次扫描。
 
 ## 架构设计
 
@@ -309,6 +310,18 @@ curl http://127.0.0.1:8000/v1/responses \
 - 逻辑账号组已绑定代理时，三类 Provider 共用该出口，绑定失败则请求失败。
 - 未绑定代理时，继续使用现有按 Provider 作用域划分的出口节点池（含 Resin `{account}` 占位符）。
 - Email 仅用于展示和检索，不作为代理身份。
+
+### FlareSolverr 自动维护 Clearance
+
+如需自动维护 Grok Web / Console 的 Cloudflare Clearance，可启动可选的 FlareSolverr Compose 服务：
+
+```bash
+docker compose --profile flaresolverr up -d
+# 或
+podman compose --profile flaresolverr up -d
+```
+
+随后在管理端打开 **运行设置 → 媒体与网络 → Clearance**，选择 `FlareSolverr`，并将服务地址设为 `http://flaresolverr:8191`。FlareSolverr 不会暴露到宿主机；每个 Web 或 Console 出口节点均使用自身代理获取匹配的 Cookie 与 User-Agent。
 
 ### Resin 粘性代理
 
