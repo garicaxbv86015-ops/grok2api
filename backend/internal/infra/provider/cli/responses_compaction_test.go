@@ -66,7 +66,7 @@ func TestGatewayCompactionResponseNormalizesPartialUsage(t *testing.T) {
 		"id":    "resp_usage",
 		"usage": map[string]any{"input_tokens": float64(7), "output_tokens": float64(5)},
 	}
-	encoded, _, err := buildGatewayCompactionResponse(response, "opaque", "grok-4.5", true)
+	encoded, _, err := buildGatewayCompactionResponse(response, nil, "opaque", "grok-4.5", true)
 	if err != nil {
 		t.Fatal(err)
 	}

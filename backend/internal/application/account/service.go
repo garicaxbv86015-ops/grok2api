@@ -2295,7 +2295,7 @@ func (s *Service) refreshBilling(ctx context.Context, id uint64) (accountdomain.
 			}
 		}
 	}
-	billing, err := s.fetchAndSaveBillingForCredential(ctx, id, value)
+	_, billing, err := s.fetchAndSaveBillingForCredential(ctx, id, value)
 	if err != nil {
 		return accountdomain.Billing{}, err
 	}

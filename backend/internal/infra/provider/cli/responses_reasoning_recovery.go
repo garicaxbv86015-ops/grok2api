@@ -20,7 +20,7 @@ var reasoningDecodeFailureMarkers = [][]byte{
 //
 // 重试策略（同账号、同 base URL）：
 //  1. 剥离 input 中的 reasoning/compaction 等不透明密文后重试；
-//  2. 若仍失败（或 body 中本就没有可剥离密文），再清空 prompt_cache_key / 会话头后重试。
+//  2. 若仍失败（或 body 中本就没有可剥离密文），再清空续接字段并轮换会话后重试。
 //
 // 跨账号复用同一 session/prompt_cache_key 时，上游可能持有不可解的 compaction 状态；
 // 仅剥离 body 密文不够，必须轮换会话身份。
@@ -49,26 +49,30 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 	}
 
 	type recoveryAttempt struct {
-		body         []byte
-		clearSession bool
+		body          []byte
+		rotateSession bool
 	}
 	var attempts []recoveryAttempt
 	downgraded, stripped := stripOpaqueEncryptedState(body)
 	if stripped {
-		attempts = append(attempts, recoveryAttempt{body: downgraded, clearSession: false})
-		// 密文剥离后仍可能踩中跨账号会话状态，再试一轮无会话请求。
-		attempts = append(attempts, recoveryAttempt{body: clearContinuationStateFields(downgraded), clearSession: true})
+		attempts = append(attempts, recoveryAttempt{body: downgraded, rotateSession: false})
+		// 密文剥离后仍可能踩中跨账号会话状态，再试一轮新会话请求。
+		attempts = append(attempts, recoveryAttempt{body: clearContinuationStateFields(downgraded), rotateSession: true})
 	} else {
 		// body 无密文却报 compaction blob：多半是 session/prompt_cache 侧残留状态。
-		attempts = append(attempts, recoveryAttempt{body: clearContinuationStateFields(body), clearSession: true})
+		attempts = append(attempts, recoveryAttempt{body: clearContinuationStateFields(body), rotateSession: true})
 	}
 
 	for _, attempt := range attempts {
 		retryRequest := request
 		retryRequest.IdempotencyID, _ = security.NewOpaqueToken(18)
-		if attempt.clearSession {
-			// 空 key 使 applyHeaders 生成新的 x-grok-session-id / conv-id。
-			retryRequest.PromptCacheKey = ""
+		if attempt.rotateSession {
+			// 显式生成一次性会话键，避免改变普通空键请求保持无状态的协议语义。
+			freshSessionKey, sessionErr := security.NewOpaqueToken(18)
+			if sessionErr != nil {
+				return original, requestURL, false
+			}
+			retryRequest.PromptCacheKey = freshSessionKey
 		}
 		retry, retryURL, retryErr := a.doResponseRequest(ctx, retryRequest, accessToken, attempt.body, base)
 		if retryErr != nil {
@@ -88,7 +92,7 @@ func (a *Adapter) recoverReasoningDecodeFailure(
 		}
 		// 仅当“剥离密文但保留会话”的第一次重试仍是同类解码错误时，
 		// 才继续轮换会话。其他失败不能证明与会话状态有关，应保留原始 400。
-		if attempt.clearSession {
+		if attempt.rotateSession {
 			_ = retry.Body.Close()
 			return original, requestURL, false
 		}
@@ -135,6 +139,7 @@ func stripReasoningEncryptedContent(body []byte) ([]byte, bool) {
 //   - type=reasoning 的 encrypted_content（保留可读 summary/content）
 //   - type=compaction/compaction_summary 整项（外来 blob 无法被 Grok 解密）
 //   - 其他 input item 顶层 encrypted_content
+//
 // 参数 body 为 Responses 请求体；返回值依次为降级请求体以及内容是否发生变化。
 func stripOpaqueEncryptedState(body []byte) ([]byte, bool) {
 	var payload map[string]any
