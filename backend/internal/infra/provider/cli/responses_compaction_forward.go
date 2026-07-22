@@ -112,14 +112,14 @@ func (a *Adapter) forwardGatewayCompactionWithPolicy(
 		}
 		// compaction 专用链路会在 Adapter 主流程之前返回，因此必须在这里单独处理
 		// 上游对历史密文或旧会话压缩状态的明确解码拒绝。
-		var reasoningRecovered bool
-		resp, reqURL, reasoningRecovered = a.recoverReasoningDecodeFailure(ctx, upstreamRequest, accessToken, body, base, resp, reqURL)
-		if reasoningRecovered {
+		var reasoningRecovery reasoningRecoveryOutcome
+		resp, reqURL, reasoningRecovery = a.recoverReasoningDecodeFailure(ctx, upstreamRequest, accessToken, body, base, "", resp, reqURL)
+		if reasoningRecovery.encryptedContentDowngraded || reasoningRecovery.sessionReset || reasoningRecovery.failed {
 			warningHeader := make(http.Header)
 			if warnings != "" {
 				warningHeader.Set("X-Grok2API-Compatibility-Warnings", warnings)
 			}
-			appendCompatibilityWarning(warningHeader, "reasoning_encrypted_content_downgraded")
+			reasoningRecovery.appendWarnings(warningHeader)
 			warnings = warningHeader.Get("X-Grok2API-Compatibility-Warnings")
 		}
 		modelCatalogChanged := a.modelCatalogChanged(request.Credential.ID, resp.Header.Get("x-models-etag"))
