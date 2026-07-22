@@ -1,5 +1,5 @@
 import { apiRequest, type PaginatedDTO } from "@/shared/api/client";
-import { createPaginatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isOneOf, isOptional, isString } from "@/shared/api/decoder";
+import { createObjectDecoder, createPaginatedDecoder, decodeBooleanResult, decodeCountResult, hasShape, isArrayOf, isBoolean, isNumber, isOneOf, isOptional, isString } from "@/shared/api/decoder";
 
 import type { AccountProvider } from "@/features/accounts/accounts-api";
 
@@ -34,6 +34,13 @@ export type AccountFamilyProxyInput = {
   clearProxy?: boolean;
 };
 
+export type AccountFamilyCleanupDTO = {
+  // families 是被删除的逻辑账号组数量。
+  families: number;
+  // members 是被删除的 Provider 成员数量。
+  members: number;
+};
+
 const accountFamilyMemberValidator = hasShape({
   id: isString, provider: isOneOf("grok_build", "grok_web", "grok_console"), name: isString,
   email: isOptional(isString), enabled: isBoolean, authStatus: isOneOf("active", "reauthRequired"),
@@ -43,6 +50,7 @@ const accountFamilyValidator = hasShape({
   members: isArrayOf(accountFamilyMemberValidator), createdAt: isString, updatedAt: isString,
 });
 const decodeAccountFamilyPage = createPaginatedDecoder<AccountFamilyDTO>(accountFamilyValidator);
+const decodeAccountFamilyCleanup = createObjectDecoder<AccountFamilyCleanupDTO>("account family cleanup", { families: isNumber, members: isNumber });
 
 // listAccountFamilies 分页查询逻辑账号组；input 包含分页、搜索和绑定筛选；返回分页账号组。
 export function listAccountFamilies(input: AccountFamilyListInput): Promise<PaginatedDTO<AccountFamilyDTO>> {
@@ -55,6 +63,11 @@ export function listAccountFamilies(input: AccountFamilyListInput): Promise<Pagi
 // deleteAccountFamily 删除逻辑账号组及其全部 Provider 成员；id 为组标识；返回删除成员数量。
 export function deleteAccountFamily(id: string): Promise<{ deleted: number }> {
   return apiRequest(`/api/admin/v1/account-families/${id}`, { method: "DELETE" }, decodeCountResult<{ deleted: number }>("deleted"));
+}
+
+// cleanupAccountFamiliesWithoutBuild 清理全部成员中没有 Build 账号的逻辑账号组；返回删除的组数和成员数。
+export function cleanupAccountFamiliesWithoutBuild(): Promise<AccountFamilyCleanupDTO> {
+  return apiRequest("/api/admin/v1/account-families/cleanup-without-build", { method: "POST" }, decodeAccountFamilyCleanup);
 }
 
 // updateAccountFamilyProxy 更新单个账号组代理；id 为组标识，input 为绑定或解绑指令；返回是否更新。

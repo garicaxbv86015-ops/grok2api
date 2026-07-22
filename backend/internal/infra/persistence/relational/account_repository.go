@@ -187,28 +187,8 @@ func (r *AccountRepository) DeleteFamily(ctx context.Context, familyID uint64) (
 		if err := tx.Model(&accountModel{}).Where("family_id = ?", familyID).Order("id ASC").Pluck("id", &accountIDs).Error; err != nil {
 			return err
 		}
-		// 1. 媒体任务限制删除账号，先清理任务及其上传票据；已生成媒体资产作为独立资源保留。
-		if len(accountIDs) > 0 {
-			var mediaJobIDs []string
-			if err := tx.Model(&mediaJobModel{}).Where("account_id IN ?", accountIDs).Pluck("id", &mediaJobIDs).Error; err != nil {
-				return err
-			}
-			if len(mediaJobIDs) > 0 {
-				if err := tx.Where("job_id IN ?", mediaJobIDs).Delete(&mediaUploadTicketModel{}).Error; err != nil {
-					return err
-				}
-				if err := tx.Where("id IN ?", mediaJobIDs).Delete(&mediaJobModel{}).Error; err != nil {
-					return err
-				}
-			}
-			// 2. 删除成员，复用账号外键级联清理额度、模型能力和 Provider 绑定。
-			result := tx.Where("id IN ?", accountIDs).Delete(&accountModel{})
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected != int64(len(accountIDs)) {
-				return fmt.Errorf("逻辑账号成员删除数量不一致: 预期 %d，实际 %d", len(accountIDs), result.RowsAffected)
-			}
+		if err := deleteAccountFamilyMembers(tx, accountIDs); err != nil {
+			return err
 		}
 		// 3. 成员清空后删除账号组，代理资源仅解除引用且不会被删除。
 		result := tx.Delete(&accountFamilyModel{}, familyID)
@@ -224,6 +204,109 @@ func (r *AccountRepository) DeleteFamily(ctx context.Context, familyID uint64) (
 		return nil, mapError(err)
 	}
 	return accountIDs, nil
+}
+
+// DeleteFamiliesWithoutBuild 在单次事务中删除所有不含 Build 成员的逻辑账号组。
+// 参数 ctx 为上下文；返回被删除的账号组、Provider 成员标识和错误。
+func (r *AccountRepository) DeleteFamiliesWithoutBuild(ctx context.Context) (repository.AccountFamilyCleanupResult, error) {
+	cleanup := repository.AccountFamilyCleanupResult{FamilyIDs: []uint64{}, AccountIDs: []uint64{}}
+	err := r.db.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var familyIDs []uint64
+		query := tx.Model(&accountFamilyModel{}).
+			Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("NOT EXISTS (SELECT 1 FROM provider_accounts build_member WHERE build_member.family_id = account_families.id AND build_member.provider = ?)", string(account.ProviderBuild))
+		if err := query.Order("account_families.id ASC").Pluck("account_families.id", &familyIDs).Error; err != nil {
+			return err
+		}
+		// 1. 锁定候选组后再次确认 Build 成员，避免转换或导入并发写入导致误删。
+		familyIDs, err := filterFamiliesWithoutBuild(tx, familyIDs)
+		if err != nil {
+			return err
+		}
+		if len(familyIDs) == 0 {
+			return nil
+		}
+		cleanup.FamilyIDs = append(cleanup.FamilyIDs, familyIDs...)
+		if err := tx.Model(&accountModel{}).Where("family_id IN ?", familyIDs).Order("id ASC").Pluck("id", &cleanup.AccountIDs).Error; err != nil {
+			return err
+		}
+		// 2. 复用整组删除规则，先清理媒体任务，再由账号外键级联清理成员子数据。
+		if err := deleteAccountFamilyMembers(tx, cleanup.AccountIDs); err != nil {
+			return err
+		}
+		// 3. 删除已清空的逻辑账号组，代理资源只解除引用并保留。
+		result := tx.Where("id IN ?", familyIDs).Delete(&accountFamilyModel{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != int64(len(familyIDs)) {
+			return fmt.Errorf("逻辑账号组删除数量不一致: 预期 %d，实际 %d", len(familyIDs), result.RowsAffected)
+		}
+		return nil
+	})
+	if err != nil {
+		return repository.AccountFamilyCleanupResult{}, mapError(err)
+	}
+	return cleanup, nil
+}
+
+// filterFamiliesWithoutBuild 在事务内排除已出现 Build 成员的逻辑账号组。
+// 参数 db 为事务内数据库句柄，familyIDs 为已锁定的候选组；返回仍不含 Build 的组标识和错误。
+func filterFamiliesWithoutBuild(db *gorm.DB, familyIDs []uint64) ([]uint64, error) {
+	if len(familyIDs) == 0 {
+		return []uint64{}, nil
+	}
+	var buildFamilyIDs []uint64
+	if err := db.Model(&accountModel{}).
+		Where("family_id IN ? AND provider = ?", familyIDs, string(account.ProviderBuild)).
+		Distinct("family_id").Pluck("family_id", &buildFamilyIDs).Error; err != nil {
+		return nil, err
+	}
+	if len(buildFamilyIDs) == 0 {
+		return familyIDs, nil
+	}
+	buildFamilySet := make(map[uint64]struct{}, len(buildFamilyIDs))
+	for _, familyID := range buildFamilyIDs {
+		buildFamilySet[familyID] = struct{}{}
+	}
+	filtered := make([]uint64, 0, len(familyIDs)-len(buildFamilyIDs))
+	for _, familyID := range familyIDs {
+		if _, exists := buildFamilySet[familyID]; exists {
+			continue
+		}
+		filtered = append(filtered, familyID)
+	}
+	return filtered, nil
+}
+
+// deleteAccountFamilyMembers 删除逻辑账号组成员及其媒体任务记录。
+// 参数 tx 为事务内数据库句柄，accountIDs 为待删除成员标识；返回删除过程中的错误。
+func deleteAccountFamilyMembers(tx *gorm.DB, accountIDs []uint64) error {
+	if len(accountIDs) == 0 {
+		return nil
+	}
+	// 1. 媒体任务限制删除账号，先清理任务及其上传票据；已生成媒体资产作为独立资源保留。
+	var mediaJobIDs []string
+	if err := tx.Model(&mediaJobModel{}).Where("account_id IN ?", accountIDs).Pluck("id", &mediaJobIDs).Error; err != nil {
+		return err
+	}
+	if len(mediaJobIDs) > 0 {
+		if err := tx.Where("job_id IN ?", mediaJobIDs).Delete(&mediaUploadTicketModel{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("id IN ?", mediaJobIDs).Delete(&mediaJobModel{}).Error; err != nil {
+			return err
+		}
+	}
+	// 2. 删除成员，复用账号外键级联清理额度、模型能力和 Provider 绑定。
+	result := tx.Where("id IN ?", accountIDs).Delete(&accountModel{})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != int64(len(accountIDs)) {
+		return fmt.Errorf("逻辑账号成员删除数量不一致: 预期 %d，实际 %d", len(accountIDs), result.RowsAffected)
+	}
+	return nil
 }
 
 func (r *AccountRepository) ListProviderAccountBatch(ctx context.Context, providerValue account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error) {

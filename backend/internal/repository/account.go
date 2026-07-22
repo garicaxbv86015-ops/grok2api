@@ -28,6 +28,14 @@ type AccountFamilyUpsertResult struct {
 	Accounts []AccountUpsertResult
 }
 
+// AccountFamilyCleanupResult 表示按条件清理逻辑账号组后的删除对象。
+type AccountFamilyCleanupResult struct {
+	// FamilyIDs 是本次被删除的逻辑账号组标识。
+	FamilyIDs []uint64
+	// AccountIDs 是本次被删除的 Provider 成员标识。
+	AccountIDs []uint64
+}
+
 // AccountRepository 定义 OAuth 账号和额度快照持久化能力。
 type AccountRepository interface {
 	List(ctx context.Context, query AccountListQuery) ([]account.Credential, int64, error)
@@ -35,6 +43,8 @@ type AccountRepository interface {
 	ListFamilies(ctx context.Context, query AccountFamilyListQuery) ([]account.Family, int64, error)
 	// DeleteFamily 在单次事务中删除逻辑账号组及其全部 Provider 成员；ctx 为上下文，familyID 为账号组标识；返回已删除成员标识和错误。
 	DeleteFamily(ctx context.Context, familyID uint64) ([]uint64, error)
+	// DeleteFamiliesWithoutBuild 在单次事务中删除不含 Build 成员的逻辑账号组；ctx 为上下文；返回被删除的组和成员标识。
+	DeleteFamiliesWithoutBuild(ctx context.Context) (AccountFamilyCleanupResult, error)
 	// ListProviderAccountBatch 以 ID 游标取一批账号；total 仅在 afterID 为 0 时返回。
 	ListProviderAccountBatch(ctx context.Context, provider account.Provider, afterID uint64, limit int) ([]account.Credential, int64, error)
 	Summarize(ctx context.Context, now time.Time) ([]AccountSummary, error)

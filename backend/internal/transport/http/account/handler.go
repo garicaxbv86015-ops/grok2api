@@ -139,6 +139,7 @@ func (h *Handler) RegisterPublic(router *gin.RouterGroup) {
 // 参数 router 为已挂载管理员认证中间件的路由分组；无返回值。
 func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/account-families", h.listFamilies)
+	router.POST("/account-families/cleanup-without-build", h.cleanupFamiliesWithoutBuild)
 	router.PATCH("/account-families/batch/proxy", h.batchUpdateFamilyProxy)
 	router.PATCH("/account-families/:id/proxy", h.updateFamilyProxy)
 	router.DELETE("/account-families/:id", h.deleteFamily)
@@ -391,6 +392,14 @@ type accountFamilyMemberResponse struct {
 	AuthStatus string `json:"authStatus"`
 }
 
+// accountFamilyCleanupResponse 表示一键清理逻辑账号的删除汇总。
+type accountFamilyCleanupResponse struct {
+	// Families 是被删除的逻辑账号组数量。
+	Families int `json:"families"`
+	// Members 是被删除的 Provider 成员数量。
+	Members int `json:"members"`
+}
+
 type quotaWindowResponse struct {
 	Mode          string                   `json:"mode"`
 	Remaining     int                      `json:"remaining"`
@@ -498,6 +507,17 @@ func (h *Handler) listFamilies(c *gin.Context) {
 		items = append(items, newAccountFamilyResponse(value))
 	}
 	response.Success(c, http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize, "total": total})
+}
+
+// cleanupFamiliesWithoutBuild 清理全部成员中没有 Build 账号的逻辑账号组。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) cleanupFamiliesWithoutBuild(c *gin.Context) {
+	result, err := h.service.CleanupFamiliesWithoutBuild(c.Request.Context())
+	if err != nil {
+		h.writeServiceError(c, "accountFamilyCleanupFailed", err, http.StatusInternalServerError, "清理无 Build 逻辑账号失败")
+		return
+	}
+	response.Success(c, http.StatusOK, accountFamilyCleanupResponse{Families: result.Families, Members: result.Members})
 }
 
 // deleteFamily 删除逻辑账号组及其全部 Provider 成员。

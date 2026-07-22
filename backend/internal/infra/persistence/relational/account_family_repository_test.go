@@ -149,6 +149,66 @@ func TestAccountRepositoryDeletesLogicalFamilyWithAllMembers(t *testing.T) {
 	}
 }
 
+// TestAccountRepositoryCleansFamiliesWithoutBuild 验证一键清理只删除不含 Build 的组，并联动删除 Web、Console 成员。
+// 参数 t 为测试上下文；无返回值。
+func TestAccountRepositoryCleansFamiliesWithoutBuild(t *testing.T) {
+	ctx := context.Background()
+	database := openTestDatabase(t)
+	accounts := NewAccountRepository(database)
+	missingWeb, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "cleanup-missing-web",
+		SourceKey: "cleanup-missing-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	missingConsole, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		FamilyID: missingWeb.FamilyID, Provider: account.ProviderConsole, AuthType: account.AuthTypeSSO, Name: "cleanup-missing-console",
+		SourceKey: "cleanup-missing-console", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptWeb, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderWeb, AuthType: account.AuthTypeSSO, Name: "cleanup-kept-web",
+		SourceKey: "cleanup-kept-web", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptBuild, _, err := accounts.UpsertByIdentity(ctx, account.Credential{
+		Provider: account.ProviderBuild, AuthType: account.AuthTypeOAuth, Name: "cleanup-kept-build",
+		SourceKey: "cleanup-kept-build", EncryptedAccessToken: testEncryptedToken, AuthStatus: account.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounts.LinkWebToBuild(ctx, keptWeb.ID, keptBuild.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := accounts.DeleteFamiliesWithoutBuild(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.FamilyIDs) != 1 || result.FamilyIDs[0] != missingWeb.FamilyID {
+		t.Fatalf("deleted family ids = %#v", result.FamilyIDs)
+	}
+	if len(result.AccountIDs) != 2 {
+		t.Fatalf("deleted account ids = %#v", result.AccountIDs)
+	}
+	for _, id := range []uint64{missingWeb.ID, missingConsole.ID} {
+		if _, err := accounts.Get(ctx, id); !errors.Is(err, repository.ErrNotFound) {
+			t.Fatalf("missing-build member %d error = %v", id, err)
+		}
+	}
+	for _, id := range []uint64{keptWeb.ID, keptBuild.ID} {
+		if _, err := accounts.Get(ctx, id); err != nil {
+			t.Fatalf("Build family member %d was removed: %v", id, err)
+		}
+	}
+}
+
 // TestAccountRepositoryListsLogicalFamiliesAndSharedProxy 验证一个逻辑账号组会聚合三类成员并只绑定一次代理。
 func TestAccountRepositoryListsLogicalFamiliesAndSharedProxy(t *testing.T) {
 	ctx := context.Background()

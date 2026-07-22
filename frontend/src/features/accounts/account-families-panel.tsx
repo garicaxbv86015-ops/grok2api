@@ -13,7 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableActionCell, TableActionHead, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { AccountFamilyProxyDialog } from "@/features/accounts/account-family-proxy-dialog";
-import { batchUpdateAccountFamilyProxy, deleteAccountFamily, listAccountFamilies, updateAccountFamilyProxy, type AccountFamilyDTO, type AccountFamilyMemberDTO, type AccountFamilyProxyInput } from "@/features/accounts/account-families-api";
+import { batchUpdateAccountFamilyProxy, cleanupAccountFamiliesWithoutBuild, deleteAccountFamily, listAccountFamilies, updateAccountFamilyProxy, type AccountFamilyDTO, type AccountFamilyMemberDTO, type AccountFamilyProxyInput } from "@/features/accounts/account-families-api";
 import { EmptyState, ErrorState, TableLoadingRow } from "@/shared/components/data-state";
 import { DataTableShell } from "@/shared/components/data-table-shell";
 import { Pagination } from "@/shared/components/pagination";
@@ -34,6 +34,7 @@ export function AccountFamiliesPanel() {
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [bindingTarget, setBindingTarget] = useState<BindingTarget | null>(null);
   const [deleting, setDeleting] = useState<AccountFamilyDTO | null>(null);
+  const [cleanupOpen, setCleanupOpen] = useState(false);
   const debouncedSearch = useDebouncedValue(search);
 
   const familiesQuery = useQuery({
@@ -57,6 +58,16 @@ export function AccountFamiliesPanel() {
       setSelected(new Set());
       refreshAccountFamilyCaches();
       toast.success(t("accountFamilies.deleted", { count: result.deleted }));
+    },
+    onError: showAccountFamilyError,
+  });
+  const cleanupMutation = useMutation({
+    mutationFn: cleanupAccountFamiliesWithoutBuild,
+    onSuccess: (result) => {
+      setCleanupOpen(false);
+      setSelected(new Set());
+      refreshAccountFamilyCaches();
+      toast.success(t("accountFamilies.cleanedWithoutBuild", { families: result.families, members: result.members }));
     },
     onError: showAccountFamilyError,
   });
@@ -144,6 +155,7 @@ export function AccountFamiliesPanel() {
         </Select>
         <div className="ml-auto flex flex-wrap items-center gap-1.5">
           {selectedOnPage.length > 0 ? <><span className="mr-1 text-xs text-muted-foreground">{t("common.selectedCount", { count: selectedOnPage.length })}</span><Button variant="secondary" size="sm" onClick={beginBatchProxyEdit}>{t("accountFamilies.batchBindProxy")}</Button></> : null}
+          <Button variant="secondary" size="sm" disabled={familiesQuery.isFetching || cleanupMutation.isPending} onClick={() => setCleanupOpen(true)}>{cleanupMutation.isPending ? <Spinner /> : <Trash2 />}{t("accountFamilies.cleanupWithoutBuild")}</Button>
           <Button variant="secondary" size="sm" disabled={familiesQuery.isFetching} onClick={() => { setSelected(new Set()); void familiesQuery.refetch(); }}>{familiesQuery.isFetching ? <Spinner /> : <RefreshCw />}{t("common.refresh")}</Button>
         </div>
       </>}
@@ -188,6 +200,13 @@ export function AccountFamiliesPanel() {
         <AlertDialogContent>
           <AlertDialogHeader><AlertDialogTitle>{t("accountFamilies.deleteTitle", { name: deleting ? primaryMember(deleting.members)?.name || deleting.id : "" })}</AlertDialogTitle><AlertDialogDescription>{t("accountFamilies.deleteDescription")}</AlertDialogDescription></AlertDialogHeader>
           <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction className="bg-destructive text-white hover:bg-destructive/90" disabled={deleteMutation.isPending} onClick={() => deleting && deleteMutation.mutate(deleting.id)}>{deleteMutation.isPending ? <Spinner /> : null}{t("common.delete")}</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={cleanupOpen} onOpenChange={(open) => !open && setCleanupOpen(false)}>
+        <AlertDialogContent>
+          <AlertDialogHeader><AlertDialogTitle>{t("accountFamilies.cleanupWithoutBuildTitle")}</AlertDialogTitle><AlertDialogDescription>{t("accountFamilies.cleanupWithoutBuildDescription")}</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel>{t("common.cancel")}</AlertDialogCancel><AlertDialogAction className="bg-destructive text-white hover:bg-destructive/90" disabled={cleanupMutation.isPending} onClick={() => cleanupMutation.mutate()}>{cleanupMutation.isPending ? <Spinner /> : null}{t("accountFamilies.cleanupWithoutBuildStart")}</AlertDialogAction></AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
     </DataTableShell>

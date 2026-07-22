@@ -100,6 +100,67 @@ func TestDeleteFamilyReturnsDeletedMemberCountAndNotFound(t *testing.T) {
 	}
 }
 
+// TestCleanupFamiliesWithoutBuildReturnsDeletedGroupsAndMembers 验证 HTTP 一键清理只删除无 Build 的逻辑账号组。
+// 参数 t 为测试上下文；无返回值。
+func TestCleanupFamiliesWithoutBuildReturnsDeletedGroupsAndMembers(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "account-family-cleanup-handler.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repository := relational.NewAccountRepository(database)
+	missingWeb, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "handler-cleanup-missing-web",
+		SourceKey: "handler-cleanup-missing-web", EncryptedAccessToken: "encrypted-token", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		FamilyID: missingWeb.FamilyID, Provider: accountdomain.ProviderConsole, AuthType: accountdomain.AuthTypeSSO, Name: "handler-cleanup-missing-console",
+		SourceKey: "handler-cleanup-missing-console", EncryptedAccessToken: "encrypted-token", AuthStatus: accountdomain.AuthStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	keptWeb, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO, Name: "handler-cleanup-kept-web",
+		SourceKey: "handler-cleanup-kept-web", EncryptedAccessToken: "encrypted-token", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keptBuild, _, err := repository.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth, Name: "handler-cleanup-kept-build",
+		SourceKey: "handler-cleanup-kept-build", EncryptedAccessToken: "encrypted-token", AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.LinkWebToBuild(ctx, keptWeb.ID, keptBuild.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewHandler(accountapp.NewService(repository, nil, nil, nil, nil, nil, nil), nil)
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/v1/account-families/cleanup-without-build", nil)
+	handler.cleanupFamiliesWithoutBuild(requestContext)
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"families":1`) || !strings.Contains(recorder.Body.String(), `"members":2`) {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if _, err := repository.Get(ctx, keptWeb.ID); err != nil {
+		t.Fatalf("Web member in Build family was removed: %v", err)
+	}
+	if _, err := repository.Get(ctx, keptBuild.ID); err != nil {
+		t.Fatalf("Build member was removed: %v", err)
+	}
+}
+
 func TestWriteServiceErrorUsesCredentialLimitCodes(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {

@@ -513,6 +513,31 @@ func (s *Service) ListFamilies(ctx context.Context, page, pageSize int, search, 
 	})
 }
 
+// AccountFamilyCleanupResult 表示一键清理逻辑账号后的汇总结果。
+type AccountFamilyCleanupResult struct {
+	// Families 是被删除的逻辑账号组数量。
+	Families int
+	// Members 是被删除的 Web、Console 等 Provider 成员数量。
+	Members int
+}
+
+// CleanupFamiliesWithoutBuild 清理全部成员中没有 Build 账号的逻辑账号组。
+// 参数 ctx 为请求上下文；返回删除的逻辑账号组数量、成员数量和错误。
+func (s *Service) CleanupFamiliesWithoutBuild(ctx context.Context) (AccountFamilyCleanupResult, error) {
+	cleanup, err := s.accounts.DeleteFamiliesWithoutBuild(ctx)
+	if err != nil {
+		return AccountFamilyCleanupResult{}, mapRepositoryError(err)
+	}
+	// 1. 数据库事务提交后逐个清理粘性会话和凭据刷新调度状态。
+	for _, accountID := range cleanup.AccountIDs {
+		if s.sticky != nil {
+			_ = s.sticky.DeleteByAccount(ctx, accountID)
+		}
+		s.clearRefreshState(accountID)
+	}
+	return AccountFamilyCleanupResult{Families: len(cleanup.FamilyIDs), Members: len(cleanup.AccountIDs)}, nil
+}
+
 // DeleteFamily 删除逻辑账号组及其全部 Provider 成员，并清理成员运行态。
 // 参数 ctx 为请求上下文，familyID 为逻辑账号组标识；返回已删除成员数量和错误。
 func (s *Service) DeleteFamily(ctx context.Context, familyID uint64) (int, error) {
