@@ -27,6 +27,7 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 	router.GET("/proxies", h.list)
 	router.GET("/proxies/options", h.options)
 	router.POST("/proxies", h.create)
+	router.POST("/proxies/test-all", h.testAllConnections)
 	router.PUT("/proxies/:id", h.update)
 	router.DELETE("/proxies/:id", h.delete)
 	router.POST("/proxies/:id/test", h.testConnection)
@@ -52,6 +53,22 @@ type proxyResponse struct {
 	BoundFamilyCount int64      `json:"boundFamilyCount"`
 	CreatedAt        time.Time  `json:"createdAt"`
 	UpdatedAt        time.Time  `json:"updatedAt"`
+}
+
+type batchProbeItemResponse struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	OK        bool      `json:"ok"`
+	LatencyMS *int64    `json:"latencyMS,omitempty"`
+	Error     string    `json:"error"`
+	TestedAt  time.Time `json:"testedAt"`
+}
+
+type batchProbeResponse struct {
+	Total     int                      `json:"total"`
+	Succeeded int                      `json:"succeeded"`
+	Failed    int                      `json:"failed"`
+	Items     []batchProbeItemResponse `json:"items"`
 }
 
 // list 返回通用代理分页列表。
@@ -163,6 +180,26 @@ func (h *Handler) testConnection(c *gin.Context) {
 		return
 	}
 	response.Success(c, http.StatusOK, gin.H{"ok": result.OK, "latencyMS": result.LatencyMS, "error": result.Error, "testedAt": result.TestedAt})
+}
+
+// testAllConnections 并发测试全部通用代理的外部连接能力。
+// 参数 c 为 Gin 请求上下文；响应直接写入上下文，无返回值。
+func (h *Handler) testAllConnections(c *gin.Context) {
+	result, err := h.service.TestAllConnections(c.Request.Context())
+	if err != nil {
+		h.writeError(c, err)
+		return
+	}
+	items := make([]batchProbeItemResponse, 0, len(result.Items))
+	for _, item := range result.Items {
+		items = append(items, batchProbeItemResponse{
+			ID: strconv.FormatUint(item.ID, 10), Name: item.Name, OK: item.OK,
+			LatencyMS: item.LatencyMS, Error: item.Error, TestedAt: item.TestedAt,
+		})
+	}
+	response.Success(c, http.StatusOK, batchProbeResponse{
+		Total: result.Total, Succeeded: result.Succeeded, Failed: result.Failed, Items: items,
+	})
 }
 
 // newProxyResponse 将代理领域对象转换为不含敏感地址的响应。

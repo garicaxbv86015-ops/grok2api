@@ -43,6 +43,22 @@ export type ProxyProbeDTO = {
   testedAt: string;
 };
 
+export type ProxyBatchProbeItemDTO = {
+  id: string;
+  name: string;
+  ok: boolean;
+  latencyMS?: number;
+  error: string;
+  testedAt: string;
+};
+
+export type ProxyBatchProbeDTO = {
+  total: number;
+  succeeded: number;
+  failed: number;
+  items: ProxyBatchProbeItemDTO[];
+};
+
 const proxyValidator = hasShape({
   id: isString, name: isString, protocol: isOneOf("http", "https", "socks5", "socks5h"), address: isString,
   authConfigured: isBoolean, enabled: isBoolean, lastTestOK: isOptional(isBoolean), lastLatencyMS: isOptional(isNumber),
@@ -52,6 +68,12 @@ const decodeProxy = createValidatedDecoder<ProxyDTO>("proxy", proxyValidator);
 const decodeProxyPage = createPaginatedDecoder<ProxyDTO>(proxyValidator);
 const decodeProxyOptions = createObjectDecoder<{ items: ProxyDTO[] }>("proxy options", { items: isArrayOf(proxyValidator) });
 const decodeProbe = createObjectDecoder<ProxyProbeDTO>("proxy probe", { ok: isBoolean, latencyMS: isOptional(isNumber), error: isString, testedAt: isString });
+const batchProbeItemValidator = hasShape({
+  id: isString, name: isString, ok: isBoolean, latencyMS: isOptional(isNumber), error: isString, testedAt: isString,
+});
+const decodeBatchProbe = createObjectDecoder<ProxyBatchProbeDTO>("proxy batch probe", {
+  total: isNumber, succeeded: isNumber, failed: isNumber, items: isArrayOf(batchProbeItemValidator),
+});
 
 // listProxies 查询通用代理分页列表。
 export function listProxies(input: ProxyListInput): Promise<PaginatedDTO<ProxyDTO>> {
@@ -90,4 +112,9 @@ export function deleteProxy(id: string): Promise<{ deleted: boolean }> {
 // testProxyConnection 测试单个代理连接并返回安全摘要。
 export function testProxyConnection(id: string): Promise<ProxyProbeDTO> {
   return apiRequest(`/api/admin/v1/proxies/${id}/test`, { method: "POST" }, decodeProbe);
+}
+
+// testAllProxyConnections 并发测试全部代理连接并返回汇总结果。
+export function testAllProxyConnections(): Promise<ProxyBatchProbeDTO> {
+  return apiRequest("/api/admin/v1/proxies/test-all", { method: "POST" }, decodeBatchProbe);
 }

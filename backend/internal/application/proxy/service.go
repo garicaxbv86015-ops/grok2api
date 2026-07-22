@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
@@ -56,6 +57,27 @@ type ProbeResult struct {
 	Error     string
 	TestedAt  time.Time
 }
+
+// NamedProbeResult 表示带代理标识的批量测试单项结果。
+type NamedProbeResult struct {
+	ID        uint64
+	Name      string
+	OK        bool
+	LatencyMS *int64
+	Error     string
+	TestedAt  time.Time
+}
+
+// BatchProbeResult 表示一次“测试全部代理”的汇总结果。
+type BatchProbeResult struct {
+	Total     int
+	Succeeded int
+	Failed    int
+	Items     []NamedProbeResult
+}
+
+// 批量探测并发上限：单次探测约 10s，避免同时打满出口与上游探测地址。
+const proxyBatchTestConcurrency = 8
 
 // Prober 定义代理连接测试所需的最小基础设施能力。
 type Prober interface {
@@ -194,6 +216,102 @@ func (s *Service) TestConnection(ctx context.Context, id uint64) (ProbeResult, e
 		return ProbeResult{}, err
 	}
 	return ProbeResult{OK: ok, LatencyMS: value.LastLatencyMS, Error: value.LastTestError, TestedAt: testedAt}, nil
+}
+
+// TestAllConnections 并发测试全部代理连接，并持久化每项安全测试摘要。
+// 参数 ctx 为请求上下文；返回汇总结果和仅限列表/基础设施失败的错误。
+func (s *Service) TestAllConnections(ctx context.Context) (BatchProbeResult, error) {
+	if s.prober == nil {
+		return BatchProbeResult{}, errors.New("代理连接测试器未初始化")
+	}
+	summaries, err := s.listAllProxySummaries(ctx)
+	if err != nil {
+		return BatchProbeResult{}, err
+	}
+	result := BatchProbeResult{Total: len(summaries), Items: make([]NamedProbeResult, len(summaries))}
+	if len(summaries) == 0 {
+		return result, nil
+	}
+
+	concurrency := proxyBatchTestConcurrency
+	if concurrency > len(summaries) {
+		concurrency = len(summaries)
+	}
+	jobs := make(chan int, len(summaries))
+	var waitGroup sync.WaitGroup
+	var resultLock sync.Mutex
+	for workerIndex := 0; workerIndex < concurrency; workerIndex++ {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			for itemIndex := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				summary := summaries[itemIndex]
+				probe, probeErr := s.TestConnection(ctx, summary.id)
+				item := NamedProbeResult{ID: summary.id, Name: summary.name, TestedAt: time.Now().UTC()}
+				if probeErr != nil {
+					item.OK = false
+					item.Error = safeProbeError(probeErr)
+					if item.Error == "" {
+						item.Error = "代理连接失败"
+					}
+				} else {
+					item.OK = probe.OK
+					item.LatencyMS = probe.LatencyMS
+					item.Error = probe.Error
+					item.TestedAt = probe.TestedAt
+				}
+				resultLock.Lock()
+				result.Items[itemIndex] = item
+				if item.OK {
+					result.Succeeded++
+				} else {
+					result.Failed++
+				}
+				resultLock.Unlock()
+			}
+		}()
+	}
+	for itemIndex := range summaries {
+		jobs <- itemIndex
+	}
+	close(jobs)
+	waitGroup.Wait()
+	if err := ctx.Err(); err != nil {
+		return BatchProbeResult{}, err
+	}
+	return result, nil
+}
+
+type proxySummary struct {
+	id   uint64
+	name string
+}
+
+// listAllProxySummaries 分页读取全部代理的标识与名称，供批量测试使用。
+// 参数 ctx 为请求上下文；返回摘要列表和错误。
+func (s *Service) listAllProxySummaries(ctx context.Context) ([]proxySummary, error) {
+	const pageSize = maxPageSize
+	page := 1
+	summaries := make([]proxySummary, 0)
+	for {
+		values, total, err := s.repository.List(ctx, repository.ProxyListQuery{
+			Page: repository.PageQuery{Offset: (page - 1) * pageSize, Limit: pageSize, Sort: repository.SortQuery{Field: "createdAt", Direction: repository.SortAscending}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, value := range values {
+			summaries = append(summaries, proxySummary{id: value.ID, name: value.Name})
+		}
+		if int64(len(summaries)) >= total || len(values) == 0 {
+			break
+		}
+		page++
+	}
+	return summaries, nil
 }
 
 // applyInput 将管理端输入应用到代理领域对象，并加密敏感地址。

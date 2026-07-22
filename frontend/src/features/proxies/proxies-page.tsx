@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { MoreHorizontal, Pencil, Play, Plus, Search, Trash2 } from "lucide-react";
+import { MoreHorizontal, Pencil, Play, Plus, Search, Trash2, Zap } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -23,7 +23,7 @@ import { SortableTableHead } from "@/shared/components/sortable-table-head";
 import { useDebouncedValue } from "@/shared/hooks/use-debounced-value";
 import { formatDateTime } from "@/shared/lib/format";
 import { nextTableSort, type SortOrder, type TableSort } from "@/shared/lib/table-sort";
-import { createProxy, deleteProxy, listProxies, testProxyConnection, updateProxy, type ProxyDTO, type ProxyInput } from "@/features/proxies/proxies-api";
+import { createProxy, deleteProxy, listProxies, testAllProxyConnections, testProxyConnection, updateProxy, type ProxyDTO, type ProxyInput } from "@/features/proxies/proxies-api";
 
 type ProxyEditorState = {
   current: ProxyDTO | null;
@@ -81,6 +81,22 @@ export function ProxiesPage() {
     },
     onError: showProxyError,
   });
+  const testAllMutation = useMutation({
+    mutationFn: testAllProxyConnections,
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({ queryKey: ["proxies"] });
+      if (result.total === 0) {
+        toast.message(t("proxies.testAllEmpty"));
+        return;
+      }
+      if (result.failed === 0) {
+        toast.success(t("proxies.testAllAllSucceeded", { total: result.total }));
+        return;
+      }
+      toast.warning(t("proxies.testAllCompleted", { succeeded: result.succeeded, failed: result.failed }));
+    },
+    onError: showProxyError,
+  });
 
   const result = proxiesQuery.data;
 
@@ -108,7 +124,18 @@ export function ProxiesPage() {
               <SelectContent><SelectItem value="all">{t("common.all")}</SelectItem><SelectItem value="enabled">{t("common.enabled")}</SelectItem><SelectItem value="disabled">{t("common.disabled")}</SelectItem></SelectContent>
             </Select>
           </div>
-          <Button variant="secondary" size="sm" onClick={() => void proxiesQuery.refetch()} disabled={proxiesQuery.isFetching}>{proxiesQuery.isFetching ? <Spinner /> : null}{t("common.refresh")}</Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => testAllMutation.mutate()}
+              disabled={testAllMutation.isPending}
+            >
+              {testAllMutation.isPending ? <Spinner /> : <Zap />}
+              {testAllMutation.isPending ? t("proxies.testingAll") : t("proxies.testAll")}
+            </Button>
+            <Button variant="secondary" size="sm" onClick={() => void proxiesQuery.refetch()} disabled={proxiesQuery.isFetching}>{proxiesQuery.isFetching ? <Spinner /> : null}{t("common.refresh")}</Button>
+          </div>
         </>}
         footer={<Pagination page={page} pageSize={pageSize} total={result?.total ?? 0} onPageChange={setPage} onPageSizeChange={(value) => { setPageSize(value); setPage(1); }} />}
       >
