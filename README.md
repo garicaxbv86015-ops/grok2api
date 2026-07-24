@@ -16,131 +16,149 @@
   <a href="https://github.com/chenyme/grok2api/pkgs/container/grok2api"><img alt="Docker" src="https://img.shields.io/badge/Docker-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white" /></a>
 </p>
 
-This project is a **secondary modification and enhancement** of [chenyme/grok2api](https://github.com/chenyme/grok2api).
+<p align="center">
+  <a href="https://trendshift.io/repositories/19868?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-19868" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/19868" alt="chenyme%2Fgrok2api | Trendshift" width="250" height="55"/></a>
+</p>
+
+> [!TIP]
+> Check out [DEEIX-AI / DEEIX-Chat](https://github.com/DEEIX-AI/DEEIX-Chat), a lightweight, integrated AI platform for model routing, chat, files, tools, billing, identity, and operations.
 
 > [!NOTE]
-> This project is for learning and research only. You must follow Grok's **Terms of Use** and applicable **laws and regulations**. Do not use it for illegal purposes.
+> This project is for technical research and learning purposes only. Please comply with Grok's official terms of use and local laws when using it; otherwise, you will be solely responsible for all consequences!
 
-Built on the upstream Go + React architecture, it keeps independent Build / Web / Console account pools, OpenAI- and Anthropic-compatible APIs, and the admin console, and adds **logical account families, IP management, external bulk import, Build account inspection, and response recovery** improvements.
+## Sponsors
+> [Want to sponsor this project?](mailto:chenyme03@gmail.com)
 
-## Enhancements in this fork
+<table>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE"><img src="https://raw.githubusercontent.com/Krill-ai-org/krill-ai-static/refs/heads/main/krill-logo/Eng/250x150.png" alt="Krill AI" width="160"></a></td>
+<td valign="middle">Thanks to Krill AI for sponsoring this project! Krill provides fast and stable official API access to GPT, Claude, Gemini, and a wide range of Chinese models, with enterprise customization, invoicing, and dedicated 7×16-hour technical support. Its specially adapted WebSocket connection delivers fast time to first token. Register through <a href="https://www.krill-ai.com/register?invite=KJ2VGIRVAE">this link</a>, enter the coupon code “grok2api” when ordering, and receive 23% off your first Codex package.</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://github.com/DEEIX-AI/DEEIX-Chat"><img src="frontend/public/sponner/deeix-chat_deeix-ai.png" alt="DEEIX AI / DEEIX Chat" width="160"></a></td>
+<td valign="middle">DEEIX-Chat is an open-source, self-hostable AI Chat platform for individuals, teams, and enterprises that need stable, long-term, unified access to multiple models. It brings models, conversations, files, tool calling, and administration together in one deployable and extensible system. Click <a href="https://github.com/DEEIX-AI/DEEIX-Chat">here</a> to start deploying.</td>
+</tr>
+<tr>
+<td width="200" align="center" valign="middle"><a href="https://www.right.codes/register"><img src="frontend/public/sponner/rightcode.jpg" alt="RightCode" width="160"></a></td>
+<td valign="middle">Right Code is an enterprise-grade AI Agent distribution platform that primarily provides stable access services for Claude Code, Codex, Gemini, and other models. It supports invoicing and dedicated one-to-one assistance for enterprises and teams. Thanks to Right Code for providing token support. Click <a href="https://www.right.codes/register">here</a> to register and get started.</td>
+</tr>
+</table>
 
-- **Logical account families**: Group Web / Build / Console credentials that share one login identity; manage members and egress identity together
-- **IP management**: Dedicated proxy resource page for reusable HTTP / HTTPS / SOCKS5 / SOCKS5H proxies, with connection tests, enable/disable, and reference counts
-- **Family-level proxy binding**: Each logical family binds at most one fixed proxy shared by all three Providers; bound proxies fail closed (no auto IP switch or direct fallback)
-- **Batch proxy binding**: Select families on the current page and bind / switch / unbind proxies in a single transaction
-- **External account import**: `POST /api/admin/v1/account-imports` imports email, Build OAuth, Web/Console SSO, and proxy binding as one atomic per-row operation
-- **Family deletion**: Atomically delete a family and all Provider members plus related runtime state; reusable proxies and generated media assets are retained
-- **Build inspection workbench**: Admin console workbench that classifies Build accounts and surfaces inspection results
-- **Response recovery improvements**: Stronger Build-side reasoning recovery and compaction forwarding for multi-turn / compact stability
+<br>
 
-Design docs:
+## Overview
 
-- [Account family proxy binding](./docs/design/account-family-proxy-binding.md)
-- [Account family deletion](./docs/design/account-family-deletion.md)
-- [External account family import](./docs/design/external-account-family-import.md)
+Grok2API is a Go gateway with a built-in React admin console. It manages independent Grok Build, Grok Web, and Grok Console account pools and exposes unified OpenAI- and Anthropic-compatible APIs.
 
-## Highlights (including upstream)
-
-- **Three Providers**: Build, Web, and Console keep credentials, quotas, health, cooldowns, concurrency, and model capabilities separate
-- **Compatible APIs**: Responses, Chat Completions, Anthropic Messages, Images, and asynchronous Videos
-- **Model routing**: remote discovery, static catalogs, source pinning, client permissions, and per-account capability filtering
-- **Multi-account scheduling**: priorities, quota gates, sticky sessions, concurrency leases, cooldowns, and bounded failover
-- **Multi-turn compatibility**: stored-response ownership, compaction, and optional server-side reasoning replay
-- **Media pipeline**: image generation, image editing, video jobs, local archiving, and URL/Base64/SSE output
-- **Account relationships & families**: cross-Provider weak links plus this fork's logical families and family-level proxies
-- **Runtime infrastructure**: SQLite/PostgreSQL, Memory/Redis, and HTTP/SOCKS5/Resin egress
-- **Admin console**: dashboard, accounts, logical families, IP management, model routes, client keys, media libraries, audits, Build inspection, runtime settings, and update checks
-- **Optional account auto-clean** (off by default): runtime settings can periodically hard-delete accounts already marked `reauthRequired` whose `reauth_marked_at` exceeds the configured minimum age. Cooldown-only and still-active permanent-refresh drain accounts are never selected. Accounts with active inference leases or queued/in-progress video jobs are skipped. A distributed maintenance lock prevents duplicate work across shared-runtime instances, and each tick has a bounded deletion budget. First scan waits one interval after enable and after process start; only actual policy changes reschedule the next tick.
-
-## Architecture
+### Architecture
 
 ```mermaid
-flowchart TB
-    Client["OpenAI / Anthropic Clients"] --> Compat["Compatibility API"]
-    Admin["React Admin"] --> AdminAPI["Admin API"]
+flowchart LR
+    %% Color definitions
+    classDef access fill:#e1f5fe,stroke:#01579b
+    classDef core fill:#fff3e0,stroke:#e65100
+    classDef providers fill:#f3e5f5,stroke:#4a148c
+    classDef infra fill:#e8f5e9,stroke:#1b5e20
+    classDef upstream fill:#fce4ec,stroke:#880e4f
 
-    Compat --> App["Application Services"]
-    AdminAPI --> App
+    subgraph Access["Access Domain"]
+        direction LR
+        Clients["API Clients"]
+        Admin["React Admin"]
+    end
 
-    App --> Router["Model Router"]
-    Router --> Selector["Account Selector"]
-    Selector --> Registry["Provider Registry"]
+    subgraph Core["Gateway Core Domain"]
+        direction LR
+        Management["Management Services<br/>Accounts · Models · Keys · Settings"]
+        Sync["Account Sync<br/>Credentials · Quota · Models"]
+        Gateway["Gateway Service<br/>Protocols · Routing · Selection · Retry"]
+        Audit["Audit Service<br/>Usage · Client Billing"]
+        Management --> Sync
+        Gateway -.-> Audit
+    end
 
-    Registry --> Build["Grok Build Adapter"]
-    Registry --> Web["Grok Web Adapter"]
-    Registry --> Console["Grok Console Adapter"]
+    subgraph Providers["Provider Channel Domain"]
+        direction LR
+        Registry["Provider Registry"]
+        Build["Grok Build<br/>OAuth · Dynamic Models · Billing"]
+        Web["Grok Web<br/>SSO · Remote Quota · Media"]
+        Console["Grok Console<br/>SSO · Local Window · Stateless"]
+        Registry --> Build
+        Registry --> Web
+        Registry --> Console
+    end
 
-    App --> DB["SQLite / PostgreSQL"]
-    App --> Runtime["Memory / Redis"]
-    Build --> Egress["Egress Manager"]
-    Web --> Egress
-    Console --> Egress
-    App --> Media["Media Storage"]
-    App --> Family["Account Family + Proxy"]
+    subgraph Infra["Shared Infrastructure Domain"]
+        direction LR
+        Egress["Egress Manager<br/>Scopes · Proxy Pool · Fallback · Clearance"]
+        Database[("SQLite / PostgreSQL")]
+        Runtime[("Memory / Redis")]
+    end
+
+    Upstream["🌐 Grok Upstream"]
+
+    %% Cross-domain calls
+    Clients --> Gateway
+    Admin --> Management
+    Gateway --> Registry
+    Sync --> Registry
+    Build -->|grok_build| Egress
+    Web -->|grok_web / asset| Egress
+    Console -->|grok_console| Egress
+    Egress --> Upstream
+    Management --> Database
+    Audit --> Database
+    Gateway <--> Runtime
+
+    %% Application styles
+    class Clients,Admin access
+    class Management,Sync,Gateway,Audit core
+    class Registry,Build,Web,Console providers
+    class Egress,Database,Runtime infra
+    class Upstream upstream
 ```
 
-Requests never mix account state across Providers:
+The Gateway routes requests through the Provider Registry. Account Sync refreshes credentials, quota, and models. Each Provider keeps independent account state and uses an isolated egress scope; usage, audits, and client billing are finalized after the request.
 
-1. The HTTP layer handles authentication, request limits, and protocol detection.
-2. The model router resolves a public model name to a Provider-qualified internal route.
-3. The Provider Registry verifies that the selected source supports the requested protocol or media operation.
-4. The account selector chooses an eligible account from that Provider using capability, quota, stickiness, cooldown, and concurrency state.
-5. The matching Adapter performs upstream protocol conversion and forwarding; if the logical family has a bound proxy, egress uses that proxy strictly.
-6. Audit, quota, billing, response ownership, and concurrency leases are finalized once at the end of the request.
+### Core capabilities
+
+| Area | Capabilities |
+| :-- | :-- |
+| APIs | Responses, Chat Completions, Anthropic Messages, Images, and asynchronous Videos |
+| Clients | Codex, Claude Code, OpenAI-compatible SDKs, and Anthropic-compatible SDKs |
+| Accounts | Bulk import/export, quota sync, credential renewal, conversion, tools, and cleanup |
+| Routing | Model discovery, Provider pinning, sticky sessions, quota/concurrency guards, and bounded failover |
+| Sessions | Stored responses, compact, prompt-cache affinity, and optional reasoning replay |
+| Media | Image generation/editing, video jobs, local archiving, and URL/Base64/SSE output |
+| Egress | HTTP/SOCKS/Resin, subscriptions, probes, proxy pools, allocation, fallback, and FlareSolverr |
+| Operations | Dashboard, model routes, client keys, audits, runtime settings, and media libraries |
 
 ### Provider boundaries
 
-| Provider | Authentication | Model catalog | Quota authority | Exposed capabilities |
-| :-- | :-- | :-- | :-- | :-- |
-| Grok Build | OAuth / Device OAuth | Discovered per account | Billing | Responses, Chat, Messages, Compact, stored responses, Video |
-| Grok Web | SSO | Built in and filtered by account tier | Upstream quota windows | Responses, Chat, Messages, Images, Image Edit, Video |
-| Grok Console | SSO | Built in | Local window | Stateless Responses, Chat, Messages |
+| Provider | Authentication | Models | Main capabilities |
+| :-- | :-- | :-- | :-- |
+| Grok Build | OAuth / Device OAuth | Discovered per account | Responses, Chat, Messages, compact, stored responses, video |
+| Grok Web | SSO | Built-in, filtered by tier | Responses, Chat, Messages, images, image editing, video |
+| Grok Console | SSO | Built-in | Stateless Responses, Chat, Messages |
 
-### Technology stack
-
-| Layer | Technology |
-| :-- | :-- |
-| Backend | Go 1.26, Gin, GORM |
-| Frontend | React 19, TypeScript, Vite, Tailwind CSS, shadcn/ui |
-| Database | SQLite / PostgreSQL |
-| Runtime | Memory / Redis |
-
-### Repository layout
-
-```text
-backend/
-  cmd/grok2api/          Process entry point
-  internal/domain/      Domain models and stable rules
-  internal/application/ Use cases, scheduling, and finalization
-  internal/infra/       Providers, persistence, runtime, egress, and security
-  internal/transport/   HTTP routes, authentication, and DTOs
-frontend/
-  src/app/              Routing, application shell, and global providers
-  src/features/         Feature-oriented pages and interactions
-  src/entities/         Shared domain objects
-  src/shared/           API client, auth, components, and utilities
-docs/design/            Design notes for fork enhancements
-```
+Each Provider keeps its own credentials, quota, health, cooldown, concurrency, and model capabilities. Failover stays within the selected Provider.
 
 ## Quick start
 
-### Docker Compose (recommended)
+Official images support `linux/amd64` and `linux/arm64`.
 
 ```bash
-git clone <your-fork-url>
+git clone https://github.com/chenyme/grok2api.git
 cd grok2api
 cp config.example.yaml config.yaml
 ```
 
-Generate secure secrets:
+Generate secrets and place them in `config.yaml`:
 
 ```bash
 openssl rand -hex 32
 openssl rand -base64 32
 ```
-
-Write the generated values to `config.yaml` and replace the bootstrap password:
 
 ```yaml
 secrets:
@@ -160,7 +178,7 @@ docker compose up -d
 docker compose logs -f grok2api
 ```
 
-The admin console is available at `http://127.0.0.1:8000` by default.
+Open `http://127.0.0.1:8000`. The image already includes the frontend; SQLite data and local media are stored in the Compose volume.
 
 ### Run from source
 
@@ -169,7 +187,7 @@ cp config.example.yaml config.yaml
 make run
 ```
 
-To run the frontend development server separately:
+For frontend development:
 
 ```bash
 cd frontend
@@ -177,174 +195,140 @@ pnpm install
 pnpm dev
 ```
 
-The frontend runs at `http://127.0.0.1:5173` by default and proxies API requests to `http://127.0.0.1:8000`.
+## Set up the gateway
 
-## First-time setup
+1. Sign in with the bootstrap administrator.
+2. Connect a Build, Web, or Console account.
+3. Wait for its quota and model capabilities to sync.
+4. Review the public routes under **Model Routes**.
+5. Create a client key under **Client Keys**.
+6. Call a `/v1/*` endpoint with that key.
 
-1. Sign in with the administrator created from `bootstrapAdmin`.
-2. Optionally create proxy resources under **IP Management**.
-3. Add Build, Web, or Console accounts under **Upstream Accounts**, or bulk-import logical families via the external import API.
-4. Optionally bind / batch-bind family-level proxies under **Logical Accounts**.
-5. Wait for the initial quota and model-capability sync to complete.
-6. Review public model names, sources, and enabled routes under **Model Routes**.
-7. Create a `g2a_` API key under **Client Keys**.
-8. Use that key to call `/v1/*`.
+After first sign-in, change the administrator password and remove `bootstrapAdmin` from the configuration. Never rotate `credentialEncryptionKey` after credentials have been stored.
 
-After the administrator has been created, change its password and remove `bootstrapAdmin` from the configuration. Keep `credentialEncryptionKey` permanently: changing it makes existing encrypted credentials unreadable.
+### Account operations
+
+| Provider | Connect or import | Export |
+| :-- | :-- | :-- |
+| Build | Device OAuth, JSON/JSONL | Re-importable account file |
+| Web | Pasted/TXT SSO, JSON/JSONL | Re-importable account file |
+| Console | Pasted/TXT SSO, JSON/JSONL | Re-importable account file |
+
+Imports accept UTF-8 BOM. Bulk quota sync, Build credential renewal, Web→Build/Console conversion, account tools, and cleanup report live progress.
+
+Web account tools can accept the terms, set a random birthday corresponding to an age of 20–40, and enable NSFW. Completed steps are recorded and skipped on later runs.
+
+Automatic deletion of old `reauthRequired` accounts is available but disabled by default. Active inference leases and video jobs are protected.
+
+> [!TIP]
+> To migrate from the Python version, export Grok Web SSO tokens as TXT and import them under **Grok Web**. Old pool metadata and databases are not compatible.
 
 ## Models and routing
 
-Public model names are unqualified by default. Internally, `Build/`, `Web/`, and `Console/` are used as stable route IDs. Always use the model page or this endpoint as the source of truth:
+Build models are discovered from account capabilities. Web and Console use built-in catalogs. Use the model page or `GET /v1/models` as the source of truth; the README does not maintain a static model list.
 
-```http
-GET /v1/models
-```
+Public names normally omit the Provider. Internally, routes use `Build/`, `Web/`, or `Console/`; qualified names can pin a request to one source.
 
-### Built-in Grok Web models
+Web can be weakly linked one-to-one with matching Build and Console accounts. Links share only an anonymous egress identity and provenance display. They never merge credentials, quota, health, cooldown, concurrency, capabilities, or billing.
 
-| Model | Capability | Minimum tier |
-| :-- | :-- | :-- |
-| `grok-chat-fast` | Chat / Responses / Messages | Basic |
-| `grok-chat-auto` | Chat / Responses / Messages | Super |
-| `grok-chat-expert` | Chat / Responses / Messages | Super |
-| `grok-chat-heavy` | Chat / Responses / Messages | Heavy |
-| `grok-imagine-image` | Image generation | Basic |
-| `grok-imagine-image-quality` | High-quality image generation | Super |
-| `grok-imagine-image-edit` | Image editing | Super |
-| `grok-imagine-video` | Video generation | Super |
+### Codex, Claude Code, and prompt caching
 
-### Built-in Grok Console models
+Responses and Messages support streaming, tools, reasoning, multi-turn sessions, and compaction. Stable client session signals are preserved for Grok Build prompt-cache affinity. Cache hits still require a compatible upstream account and an unchanged prompt prefix.
 
-| Model | Description |
-| :-- | :-- |
-| `grok-4.3` | Supports reasoning effort and search tools |
-| `grok-4.20-0309` | General Responses model |
-| `grok-4.20-0309-reasoning` | Reasoning variant |
-| `grok-4.20-0309-non-reasoning` | Non-reasoning variant |
-| `grok-4.20-multi-agent-0309` | Multi-agent variant |
-| `grok-build-0.1` | Build-family model |
-
-Console also exposes compatibility and reasoning-effort aliases. Console is stateless and does not support `previous_response_id`, Response retrieval/deletion, or compact.
-
-Build models are discovered from account capabilities and are not part of the Console static catalog.
+Responses and Chat Completions report OpenAI-style total input. Messages reports Anthropic-style uncached input and cache reads separately. Audits retain total and cached input for billing reconciliation.
 
 ## API
 
-Client inference endpoints require an API key:
+Inference endpoints use a client key:
 
 ```http
 Authorization: Bearer g2a_xxx_xxx
 ```
 
-| Method | Path | Description |
+| Method | Path | Purpose |
 | :-- | :-- | :-- |
-| `GET` | `/healthz` | Liveness check |
-| `GET` | `/readyz` | Layered readiness status |
-| `GET` | `/v1/models` | Currently serviceable models |
-| `POST` | `/v1/responses` | Responses JSON / SSE |
-| `POST` | `/v1/responses/compact` | Responses compact |
-| `GET` | `/v1/responses/{id}` | Retrieve a stored response |
-| `DELETE` | `/v1/responses/{id}` | Delete a stored response |
-| `POST` | `/v1/chat/completions` | Chat Completions JSON / SSE |
-| `POST` | `/v1/messages` | Anthropic Messages JSON / SSE |
-| `POST` | `/v1/images/generations` | Image generation |
-| `POST` | `/v1/images/edits` | Image editing with JSON or multipart input |
-| `POST` | `/v1/videos/generations` | Create an asynchronous video job |
-| `GET` | `/v1/videos/{request_id}` | Inspect a video job |
-| `GET` | `/v1/videos/{request_id}/content` | Retrieve video job content |
-| `GET` | `/v1/media/images/{asset_id}` | Read an archived image |
-| `GET` | `/v1/media/videos/{asset_id}` | Read an archived video |
-| `PUT` | `/v1/media/uploads/{token}` | Receive a video through a one-time upload ticket |
+| `GET` | `/healthz`, `/readyz` | Liveness and readiness |
+| `GET` | `/v1/models` | Serviceable models |
+| `POST` | `/v1/responses` | Responses JSON/SSE |
+| `POST` | `/v1/responses/compact` | Compact a supported Response session |
+| `GET`, `DELETE` | `/v1/responses/{id}` | Read or delete a stored response |
+| `POST` | `/v1/chat/completions` | Chat Completions JSON/SSE |
+| `POST` | `/v1/messages` | Anthropic Messages JSON/SSE |
+| `POST` | `/v1/images/generations`, `/v1/images/edits` | Generate or edit images |
+| `POST`, `GET` | `/v1/videos/*` | Create and inspect video jobs |
+| `GET` | `/v1/media/images/{asset_id}`, `/v1/media/videos/{asset_id}` | Read archived media |
 
-### Admin enhancements in this fork
+Stored responses and compact depend on the selected Provider. The signed-in admin console provides live examples at `/docs`; Swagger is available only when `server.swaggerEnabled: true`.
 
-| Method | Path | Description |
-| :-- | :-- | :-- |
-| `GET/POST/PATCH/DELETE` | `/api/admin/v1/proxies` | IP / proxy resource management |
-| `POST` | `/api/admin/v1/proxies/:id/test` | Test a proxy connection |
-| `GET` | `/api/admin/v1/account-families` | List logical account families |
-| `PUT` | `/api/admin/v1/account-families/:id/proxy` | Bind / switch / unbind a family proxy |
-| `POST` | `/api/admin/v1/account-families/batch/proxy` | Batch-bind proxies for selected families |
-| `DELETE` | `/api/admin/v1/account-families/:id` | Delete a logical family |
-| `POST` | `/api/admin/v1/account-imports` | Bulk-import logical families from an external system |
-
-Minimal request example:
+Client keys support model allowlists and optional RPM, concurrency, spend, and expiry limits.
 
 ```bash
-export GROK2API_API_KEY="g2a_xxx_xxx"
-
 curl http://127.0.0.1:8000/v1/responses \
-  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Authorization: Bearer g2a_xxx_xxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "grok-chat-auto",
+    "model": "your-model",
     "input": "Explain quantum tunneling in three sentences.",
     "stream": true
   }'
 ```
 
-## Configuration, runtime state, and multi-instance deployments
+## Egress and Cloudflare
 
-`config.yaml` contains startup configuration only:
+Egress nodes are scoped to Build, Web, Console, or Web assets. The admin console supports:
 
-| Group | Description |
-| :-- | :-- |
-| `server` | Listen address, request limits, timeouts, and Swagger |
-| `auth` | Admin token lifetime and secure cookies |
-| `secrets` | JWT and credential-encryption keys |
-| `frontend` | Static assets and the optional public address |
-| `database` | SQLite or PostgreSQL |
-| `runtimeStore` | Memory or Redis |
-| `media` | Media storage driver and path |
-| `routing` | Server-side multi-turn replay cache |
+- HTTP, HTTPS, SOCKS4/4A, SOCKS5/5H, and Resin
+- Subscription and text/Base64 import
+- Batch probes, filtering, deletion, assignment, and balancing
+- Fallback per scope: none, direct, or a fixed node
+- Proxy-pool mode without global cooldown after one connection failure
 
-| Deployment | Database | Runtime store | Media |
-| :-- | :-- | :-- | :-- |
-| Single instance | SQLite | Memory | Local directory |
-| Multiple instances | PostgreSQL | Redis | Shared volume or instance affinity |
-
-### Account scheduling and logical families
-
-- A sticky-session hit prefers the account already bound to the conversation. If that account is temporarily full, the selector waits briefly before borrowing another eligible account.
-- Web accounts can form one-to-one weak links with corresponding Build and Console accounts; this fork further unifies members and proxy binding through logical families.
-- When a family has a bound proxy, all three Providers share that egress endpoint; binding failures fail the request.
-- Unbound families continue to use the existing Provider-scoped egress node pools (including Resin `{account}` placeholders).
-- Email addresses are used only for display and search, never as proxy identities.
-
-### Managed FlareSolverr clearance
-
-To automatically maintain Grok Web Cloudflare Clearance, start the optional FlareSolverr Compose service:
-
-```bash
-docker compose --profile flaresolverr up -d
-# or
-podman compose --profile flaresolverr up -d
-```
-
-Then open **Runtime Settings → Media & Network → Clearance**, select `FlareSolverr`, and use `http://flaresolverr:8191` as the solver URL. FlareSolverr is not published on the host; each Web or Console egress node uses its own proxy to obtain cookies and User-Agent.
-
-### Resin sticky proxies
+Resin usernames can contain `{account}`:
 
 ```text
 socks5h://Default.{account}:RESIN_PROXY_TOKEN@resin:2260
 ```
 
-At runtime, `{account}` is replaced with a stable anonymous account identity. Linked / same-family accounts can reuse the same identity.
+The placeholder becomes a stable anonymous identity. Linked Web, Build, and Console accounts can share it; raw tokens and email addresses are not used.
 
-## Security and production guidance
+For managed Web/Console Cloudflare Clearance:
 
-- Serve the application over HTTPS and enable `auth.secureCookies` for an HTTPS admin address
-- Generate strong random values for `jwtSecret` and `credentialEncryptionKey`
-- Keep `server.swaggerEnabled: false` in production
-- Never commit OAuth data, SSO tokens, cookies, account exports, or real databases
-- Use PostgreSQL and Redis for multi-instance deployments, plus shared media storage or instance affinity
-- Back up `config.yaml`, the relational database, and the media directory
-- Place a reverse proxy, access controls, and basic network protections in front of public deployments
-- The external import endpoint has a large attack surface — restrict network access in production
+```bash
+docker compose --profile flaresolverr up -d
+```
 
-## Development and verification
+Then select `FlareSolverr` under **Runtime Settings → Media & Network → Clearance** and use `http://flaresolverr:8191`.
 
-Backend:
+The egress layer retries only connection failures known to occur before request submission. It does not replay submitted generation requests, authentication failures, exhausted quotas, or upstream rate limits.
+
+## Configuration and deployment
+
+`config.yaml` contains startup settings; Provider and operational settings are managed in the admin console and hot-reload unless marked otherwise.
+
+| Deployment | Database | Runtime store | Media |
+| :-- | :-- | :-- | :-- |
+| Single instance | SQLite | Memory | Local directory |
+| Multiple instances | PostgreSQL | Redis | Shared read/write directory |
+
+Multi-instance deployments require a unique `deployment.instanceID` per replica, one shared `clusterID`, and `sharedMedia: true` only after the media directory is shared correctly.
+
+Important optional settings:
+
+- `audit.ledgerMode`: `observe` reports ledger faults; `enforce` can pause new inference to protect billing integrity.
+- `routing.segmentedSelectorEnabled`: optimizes large account pools while retaining full-planner fallback and atomic guards.
+- Build response-header timeout and exact-match 403 invalidation rules are hot-reloadable.
+- **Sync latest version** applies the validated Grok Build client version and User-Agent.
+
+## Production checklist
+
+- Use HTTPS and enable `auth.secureCookies`.
+- Keep Swagger disabled on public deployments.
+- Use strong, backed-up secrets; never commit credentials, cookies, exports, or databases.
+- Back up `config.yaml`, the database, and media storage.
+- Use PostgreSQL, Redis, and shared media for multiple instances.
+- Put a reverse proxy and access controls in front of public deployments.
+
+## Development
 
 ```bash
 cd backend
@@ -354,8 +338,6 @@ go vet ./...
 go build ./cmd/grok2api
 ```
 
-Frontend:
-
 ```bash
 cd frontend
 pnpm install --frozen-lockfile
@@ -363,15 +345,14 @@ pnpm lint
 pnpm build
 ```
 
-After changing public API annotations, regenerate Swagger from the repository root:
+Regenerate Swagger after changing public API annotations:
 
 ```bash
 make swagger
 ```
 
-## Further reading
+## Documentation
 
 - [简体中文 README](./README.zh-CN.md)
 - [Backend guide](./backend/README.md)
 - [Frontend guide](./frontend/README.md)
-- [Upstream chenyme/grok2api](https://github.com/chenyme/grok2api)

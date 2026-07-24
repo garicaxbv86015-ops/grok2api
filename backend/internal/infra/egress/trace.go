@@ -29,6 +29,7 @@ type Trace struct {
 type traceContextKey struct{}
 type accountContextKey struct{}
 type credentialContextKey struct{}
+type egressNodeContextKey struct{}
 
 // WithAccount passes a stable Provider account identity to the egress layer. It is used only to render
 // authentication usernames for sticky proxies such as Resin and is never written to upstream headers or audit.
@@ -50,14 +51,14 @@ func WithCredential(ctx context.Context, credential accountdomain.Credential) co
 	ctx = context.WithValue(ctx, credentialContextKey{}, credential)
 	identity := strings.TrimSpace(credential.EgressIdentity)
 	if identity != "" {
-		return WithAccountIdentity(ctx, identity)
+		return WithEgressNode(WithAccountIdentity(ctx, identity), credential.EgressNodeID)
 	}
 	provider := credential.Provider
 	if provider == "" {
 		// CLI 单元测试及部分刷新路径只携带账号 ID；该上下文入口由 Build Transport 使用。
 		provider = accountdomain.ProviderBuild
 	}
-	return WithAccount(ctx, string(provider), credential.ID)
+	return WithEgressNode(WithAccount(ctx, string(provider), credential.ID), credential.EgressNodeID)
 }
 
 // CredentialFromContext 返回 Build HTTP Transport 所需的账号出口配置。
@@ -69,6 +70,27 @@ func CredentialFromContext(ctx context.Context) (accountdomain.Credential, bool)
 	value, ok := ctx.Value(credentialContextKey{}).(accountdomain.Credential)
 	return value, ok
 }
+
+// WithEgressNode attaches the explicitly assigned node ID for transports that
+// only receive a request context (notably Grok Build's RoundTripper).
+func WithEgressNode(ctx context.Context, nodeID uint64) context.Context {
+	if ctx == nil || nodeID == 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, egressNodeContextKey{}, nodeID)
+}
+
+func egressNodeFromContext(ctx context.Context) uint64 {
+	if ctx == nil {
+		return 0
+	}
+	value, _ := ctx.Value(egressNodeContextKey{}).(uint64)
+	return value
+}
+
+// EgressNodeFromContext exposes a non-sensitive binding identifier to the
+// Build transport without exposing the context key itself.
+func EgressNodeFromContext(ctx context.Context) uint64 { return egressNodeFromContext(ctx) }
 
 // WithAccountIdentity attaches the stable, non-sensitive identity used by
 // account-bound proxy templates such as Resin. Providers that represent the

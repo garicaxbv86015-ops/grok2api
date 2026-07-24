@@ -28,7 +28,7 @@ func NewProxyProber(timeout time.Duration) *ProxyProber {
 // Probe 通过代理访问探测地址并返回端到端耗时。
 // 参数 ctx 为请求上下文，proxyURL 为已解密代理地址；返回耗时和连接错误。
 func (p *ProxyProber) Probe(ctx context.Context, proxyURL string) (time.Duration, error) {
-	client, err := newBuildClient(proxyURL)
+	client, err := newBuildClient(proxyURL, p.timeout)
 	if err != nil {
 		return 0, err
 	}

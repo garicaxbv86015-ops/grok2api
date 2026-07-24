@@ -97,6 +97,7 @@ func toAccountDomain(value accountModel) account.Credential {
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt, WebTier: webTier, WebTierSyncedAt: webTierSyncedAt,
 		WebNSFWEnabledAt: webNSFWEnabledAt, WebTermsAcceptedAt: webTermsAcceptedAt, WebTermsAcceptedVersion: webTermsAcceptedVersion, WebBirthDateSetAt: webBirthDateSetAt, EgressIdentity: egressIdentity,
+		EgressNodeID: valueEgressNodeID(value.EgressNodeID), EgressAssignmentMode: account.EgressAssignmentMode(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		BuildAPIFallback: value.BuildAPIFallback, BuildRouteMode: buildRouteMode,
 		BuildSuperEntitled: value.BuildSuperEntitled && account.Provider(value.Provider) == account.ProviderBuild,
 		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt,
@@ -119,6 +120,7 @@ func fromAccountDomain(value account.Credential) accountModel {
 		CooldownUntil: value.CooldownUntil, LastError: value.LastError, LastUsedAt: value.LastUsedAt,
 		ObservedModel: value.ObservedModel, ObservedModelAt: value.ObservedModelAt,
 		BuildAPIFallback: buildAPIFallback, BuildRouteMode: string(buildRouteMode), BuildSuperEntitled: buildSuperEntitled,
+		EgressNodeID: egressNodeID(value.EgressNodeID), EgressAssignmentMode: string(value.EgressAssignmentMode), EgressAssignedAt: value.EgressAssignedAt,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 }
@@ -153,6 +155,21 @@ func fromProxyDomain(value proxy.Endpoint) proxyModel {
 		LastTestOK: value.LastTestOK, LastLatencyMS: value.LastLatencyMS, LastTestError: value.LastTestError,
 		LastTestAt: value.LastTestAt, CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
+}
+
+func valueEgressNodeID(value *uint64) uint64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func egressNodeID(value uint64) *uint64 {
+	if value == 0 {
+		return nil
+	}
+	result := value
+	return &result
 }
 
 func fromAccountCredentialDomain(value account.Credential) accountCredentialModel {

@@ -17,6 +17,7 @@ Thumbs.db
 /docs/*
 !/docs/design/
 !/docs/design/*.md
+/docs/rules/*
 /backend/docs/goal/
 *.har
 *.pcap
