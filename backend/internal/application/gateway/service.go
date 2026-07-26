@@ -616,9 +616,9 @@ attemptLoop:
 		var err error
 		selectionStarted := time.Now()
 		if ownership != nil {
-			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.UpstreamModel, quotaMode, true)
+			lease, err = s.selector.AcquirePinned(ctx, route.Provider, ownership.AccountID, route.ID, route.UpstreamModel, quotaMode, true)
 		} else {
-			lease, err = s.selector.Acquire(ctx, route.Provider, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
+			lease, err = s.selector.Acquire(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode, affinityKey, excluded, !quotaProbeAttempted)
 		}
 		timing.markSelection(time.Since(selectionStarted))
 		if err != nil {
@@ -740,19 +740,35 @@ attemptLoop:
 		}
 		egressForbidden := s.providers.RetryForbiddenAsEgress(credential.Provider) && response.StatusCode == http.StatusForbidden
 		finalEgressForbidden := egressForbidden && (attempt > 0 || attempt+1 >= attempts)
-		// 先按状态码进入失败分类。x-should-retry:false 只表示「不要原样重放同一请求」，
-		// 不能阻止账号级失败（chat permission-denied / Free Build 403 / 402 等）的冷却与换号。
-		if response != nil && isRetryable(response.StatusCode) && !finalEgressForbidden {
+		// 先分类 403 正文：明确封禁信号会使账号失效并换号；其余 403 走出口重试路径，不惩罚账号。
+		// x-should-retry:false 只表示「不要原样重放同一请求」，不能阻止账号级失败的冷却与换号。
+		if response.StatusCode == http.StatusForbidden {
 			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
 			body, _ := readRetryableBody(response.Body)
-			if egressForbidden {
-				// Web 403/code 7 means the browser session at the egress was rejected; the Provider rebuilt it and reduced node health, so do not penalize the account.
-				delete(excluded, credential.ID)
+			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+			if lastFailure.AccountBlocked {
+				failureHandled := s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+				if lastFailure.AccountScoped && !failureHandled {
+					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				}
 				lease.Release()
-				lastErr = fmt.Errorf("Grok Web 出口会话被反机器人规则拒绝")
-				lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
+				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "account_blocked", true)
 				continue
 			}
+			if egressForbidden && !finalEgressForbidden {
+				// 非封禁 403 视为出口/浏览器会话失败，不惩罚账号。
+				delete(excluded, credential.ID)
+				lease.Release()
+				lastErr = fmt.Errorf("上游出口会话被拒绝")
+				continue
+			}
+			// 将已消费的最终非封禁 403 正文还原，供后续公共响应路径使用。
+			response.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		if isRetryableResponse(response, route.Provider) && !finalEgressForbidden {
+			retryAfter := parseRetryAfter(response.Header.Get("Retry-After"), time.Now().UTC())
+			body, _ := readRetryableBody(response.Body)
 			lastFailure = newHTTPUpstreamFailure(response.StatusCode, body, credential.ID, credential.Name)
 			buildForbiddenReauth := credential.Provider == accountdomain.ProviderBuild && s.shouldInvalidateBuildForbidden(lastFailure)
 			if buildForbiddenReauth {
@@ -767,104 +783,94 @@ attemptLoop:
 			if freeBuildForbidden {
 				lastFailure.AccountScoped = true
 			}
-			// 非账号范围失败仍尊重上游 veto，原样把响应交给下游。
-			// Build 402/403 账号级失败始终进入换号路径，不受 X-Should-Retry:false 阻止。
-			if upstreamRetryVetoed(response) && !lastFailure.AccountScoped && !forcesAccountFailover(response.StatusCode, route.Provider) {
-				response.Body = io.NopCloser(bytes.NewReader(body))
-			} else {
-				if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
-					limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
-					lastFailure.AccountScoped = false
-					lastFailure.Fingerprint = "429:team_model_rate_limit"
-					lastFailure.RetryAfter = time.Until(limited.Until)
-					lease.Release()
-					lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
-					s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
-					continue
-				}
-				if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && !lastFailure.AccountBlocked && !buildForbiddenReauth && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
-					authRecoveryAttempted[credential.ID] = true
-					refreshed, refreshErr := ensureCredential(credential, true)
-					if refreshErr != nil {
-						lease.Release()
-						lastErr = refreshErr
-						lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
-						continue attemptLoop
-					}
-					response, err = forwardResponse(lease, refreshed, lease.Billing)
-					credential = refreshed
-					if err != nil {
-						lease.Release()
-						lastErr = err
-						if ctx.Err() != nil || errors.Is(err, context.Canceled) {
-							lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
-							break attemptLoop
-						}
-						lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
-						if !isRetryableTransportFailure(credential.Provider, err) {
-							break attemptLoop
-						}
-						continue attemptLoop
-					}
-					goto handleResponse
-				}
-				failureHandled := false
-				if freeBuildForbidden {
-					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-					failureHandled = true
-				} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
-					exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
-					s.selector.MarkQuotaStateChanged(credential.Provider)
-					failureHandled = reconcileErr == nil && exhausted
-				} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
-					s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit, quotaRecoveryHints{
-						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-					})
-					failureHandled = true
-				} else if lastFailure.ModelQuotaExhausted {
-					s.selector.MarkModelQuotaExhausted(ctx, credential, route.UpstreamModel, retryAfter)
-					failureHandled = true
-				} else if lastFailure.FreeQuotaExhausted {
-					s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0, quotaRecoveryHints{
-						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-					})
-					failureHandled = true
-				} else if lastFailure.QuotaExhausted {
-					s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
-						Billing: lease.Billing, QuotaMode: lease.QuotaMode, RetryAfter: retryAfter,
-					})
-					failureHandled = true
-				}
-				if lastFailure.AccountBlocked {
-					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
-				} else if buildForbiddenReauth {
-					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s upstream error code %s matched the invalidation policy", credential.Provider, lastFailure.UpstreamCode))
-				} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
-					if credential.Provider == accountdomain.ProviderBuild {
-						// A Build account may lack permission for one chat model while its OAuth credential and video
-						// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
-						s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
-						failureHandled = true
-					} else {
-						failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
-					}
-				} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
-					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
-				}
-				if lastFailure.AccountScoped && !failureHandled {
-					s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
-				}
+			if response.StatusCode == http.StatusTooManyRequests && response.RateLimit != nil && response.RateLimit.TeamID != "" && response.RateLimit.Model == route.UpstreamModel {
+				limited := s.markTeamModelRateLimit(credential, route.UpstreamModel, *response.RateLimit, time.Now().UTC())
+				lastFailure.AccountScoped = false
+				lastFailure.Fingerprint = "429:team_model_rate_limit"
+				lastFailure.RetryAfter = time.Until(limited.Until)
 				lease.Release()
-				lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
-				s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "retry_vetoed", upstreamRetryVetoed(response))
-				if !lastFailure.AccountScoped {
-					failureFingerprints[lastFailure.Fingerprint]++
-					if failureFingerprints[lastFailure.Fingerprint] >= 2 {
-						break
-					}
-				}
+				lastErr = fmt.Errorf("上游 Team 与模型请求频率受限")
+				s.logger.Warn("upstream_team_model_rate_limited", "request_id", input.RequestID, "provider", credential.Provider, "model", route.UpstreamModel, "team_fingerprint", limited.TeamFingerprint, "scope", response.RateLimit.Scope, "actual", response.RateLimit.Actual, "limit", response.RateLimit.Limit, "retry_after", lastFailure.RetryAfter)
 				continue
 			}
+			if s.providers.SupportsCredentialRefresh(credential.Provider) && !authRecoveryAttempted[credential.ID] && credential.EncryptedRefreshToken != "" && !lastFailure.AccountBlocked && !buildForbiddenReauth && (lastFailure.PermanentAccountDenial || lastFailure.CredentialRejected) {
+				authRecoveryAttempted[credential.ID] = true
+				refreshed, refreshErr := ensureCredential(credential, true)
+				if refreshErr != nil {
+					lease.Release()
+					lastErr = refreshErr
+					lastFailure = newCredentialUpstreamFailure(refreshErr, credential.ID, credential.Name)
+					continue attemptLoop
+				}
+				response, err = forwardResponse(lease, refreshed, lease.Billing)
+				credential = refreshed
+				if err != nil {
+					lease.Release()
+					lastErr = err
+					if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+						lastFailure = &UpstreamFailure{HTTPStatus: 499, Code: "request_canceled", PublicMessage: "请求已取消", AccountID: credential.ID, AccountName: credential.Name, Cause: firstError(ctx.Err(), err)}
+						break attemptLoop
+					}
+					lastFailure = newTransportUpstreamFailure(err, credential.ID, credential.Name)
+					if !isRetryableTransportFailure(credential.Provider, err) {
+						break attemptLoop
+					}
+					continue attemptLoop
+				}
+				goto handleResponse
+			}
+			failureHandled := false
+			if freeBuildForbidden {
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+				failureHandled = true
+			} else if lease.QuotaMode != "" && response.StatusCode == http.StatusTooManyRequests {
+				exhausted, reconcileErr := s.accounts.ReconcileRateLimit(ctx, credential.ID, lease.QuotaMode, retryAfter)
+				s.selector.MarkQuotaStateChanged(credential.Provider)
+				failureHandled = reconcileErr == nil && exhausted
+			} else if used, limit, exhausted := parseFreeQuotaExhaustion(body); exhausted {
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, used, limit)
+				failureHandled = true
+			} else if lastFailure.ModelQuotaExhausted {
+				s.selector.MarkModelQuotaExhausted(ctx, credential, lease.Billing, route.UpstreamModel, retryAfter)
+				failureHandled = true
+			} else if lastFailure.FreeQuotaExhausted {
+				s.selector.MarkFreeQuotaExhausted(ctx, credential, 0, 0)
+				failureHandled = true
+			} else if lastFailure.QuotaExhausted {
+				s.selector.MarkPaymentQuotaExhausted(ctx, credential, quotaRecoveryHints{
+					Billing: lease.Billing,
+				})
+				failureHandled = true
+			}
+			if lastFailure.AccountBlocked {
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s account is blocked", credential.Provider))
+			} else if buildForbiddenReauth {
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s upstream error code %s matched the invalidation policy", credential.Provider, lastFailure.UpstreamCode))
+			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.PermanentAccountDenial {
+				if credential.Provider == accountdomain.ProviderBuild {
+					// A Build account may lack permission for one chat model while its OAuth credential and video
+					// access remain valid. Isolate this denial to the model; reauthorization is needed only when the credential is rejected.
+					s.selector.MarkModelAccessDenied(ctx, credential, route.UpstreamModel, retryAfter)
+					failureHandled = true
+				} else {
+					failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s chat endpoint access denied", credential.Provider))
+				}
+			} else if s.providers.SupportsCredentialRefresh(credential.Provider) && lastFailure.CredentialRejected {
+				failureHandled = s.markReauthRequired(ctx, input.RequestID, credential, fmt.Sprintf("%s credential rejected", credential.Provider))
+			}
+			if lastFailure.AccountScoped && !failureHandled {
+				s.selector.MarkFailure(ctx, credential, response.StatusCode, retryAfter)
+			}
+			lease.Release()
+			lastErr = fmt.Errorf("上游返回 %d", response.StatusCode)
+			s.logger.Warn("upstream_request_failed", "request_id", input.RequestID, "account_id", credential.ID, "provider", credential.Provider, "status", response.StatusCode, "upstream_code", lastFailure.UpstreamCode, "account_scoped", lastFailure.AccountScoped, "retry_vetoed", upstreamRetryVetoed(response))
+			if !lastFailure.AccountScoped {
+				failureFingerprints[lastFailure.Fingerprint]++
+				if failureFingerprints[lastFailure.Fingerprint] >= 2 {
+					break
+				}
+			}
+			continue
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			s.selector.markSuccess(ctx, credential, lease.QuotaProbe)
@@ -1172,7 +1178,7 @@ func (s *Service) forwardOwnedResponse(ctx context.Context, input ResourceInput,
 		operation = "response_delete"
 	}
 	physicalCallCtx := infraegress.WithPhysicalCallTrace(ctx, string(ownership.Provider), operation)
-	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, "", "", false)
+	lease, err := s.selector.AcquirePinned(ctx, ownership.Provider, ownership.AccountID, 0, "", "", false)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrResponseAccountUnavailable, err)
 	}
