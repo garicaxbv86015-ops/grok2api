@@ -36,6 +36,48 @@ type AccountFamilyCleanupResult struct {
 	AccountIDs []uint64
 }
 
+// CredentialRefreshFailure 是最近一次 OAuth 刷新失败时持久化的有界诊断状态。
+// Response 必须在到达持久层前由 provider 适配器完成脱敏。
+type CredentialRefreshFailure struct {
+	Count     int
+	RetryAt   time.Time
+	Status    int
+	Code      string
+	Message   string
+	Response  string
+	Permanent bool
+}
+
+// LinkedDeleteResolution 是带可选关联账号时服务端展开的删除范围。
+type LinkedDeleteResolution struct {
+	RootIDs          []uint64
+	FinalIDs         []uint64
+	LinkedByProvider map[account.Provider]int
+	// RootGroups 将每个根账号映射到最终关联成员，并定义媒体任务跳过的组边界。
+	RootGroups map[uint64][]uint64
+	// PeerProviders 记录每个关联成员的 Provider，用于删除后的统计。
+	PeerProviders map[uint64]account.Provider
+}
+
+// LinkedDeleteOutcome 包含实际删除行与因媒体任务而跳过的根组。
+type LinkedDeleteOutcome struct {
+	Resolution              LinkedDeleteResolution
+	DeletedIDs              []uint64
+	Deleted                 int64
+	RootsDeleted            int64
+	LinkedDeletedByProvider map[account.Provider]int64
+	// SkippedRoots 标识因排队中或进行中视频任务而受保护的组。
+	SkippedRoots []uint64
+}
+
+// CleanupPreview 是清理确认对话框使用的 COUNT-only 预览结果。
+type CleanupPreview struct {
+	RootsByStatus    map[string]int64
+	RootCount        int64
+	LinkedByProvider map[account.Provider]int64
+	Total            int64
+}
+
 // ObservedModelWriter reports whether an observed model update changed the authoritative row.
 type ObservedModelWriter interface {
 	UpdateObservedModelIfNewer(ctx context.Context, id uint64, model string, observedAt time.Time) (bool, error)
@@ -61,6 +103,10 @@ type AccountRepository interface {
 	Summarize(ctx context.Context, now time.Time) ([]AccountSummary, error)
 	ListEnabled(ctx context.Context, provider account.Provider) ([]account.Credential, error)
 	ListEnabledAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error)
+	// ListEnabledCredentialRefreshAccountIDs includes enabled active and
+	// reauthRequired accounts so an explicit administrator refresh can retry a
+	// previously rejected refresh token once.
+	ListEnabledCredentialRefreshAccountIDs(ctx context.Context, provider account.Provider, refreshableOnly bool) ([]uint64, error)
 	CountProviderAccountsByIDs(ctx context.Context, provider account.Provider, ids []uint64) (int64, error)
 	// FilterMissingBuildConversionIDs 从指定账号中排除已经关联 Build 的 Web 账号。
 	FilterMissingBuildConversionIDs(ctx context.Context, ids []uint64) ([]uint64, error)
@@ -72,6 +118,7 @@ type AccountRepository interface {
 	ListMissingConsoleSyncBatch(ctx context.Context, afterID uint64, limit int) ([]account.Credential, int64, int64, error)
 	HasActive(ctx context.Context, provider account.Provider) (bool, error)
 	ListRoutingCandidates(ctx context.Context, provider account.Provider, modelRouteID uint64, upstreamModel, quotaMode string) ([]account.RoutingCandidate, error)
+	GetCredentialMaterial(ctx context.Context, accountID uint64, provider account.Provider) (account.CredentialMaterial, error)
 	Get(ctx context.Context, id uint64) (account.Credential, error)
 	// SetFamilyProxy 更新单个逻辑账号组的固定代理；ctx 为上下文，familyID 为账号组标识，proxyID 为 nil 时解除绑定；返回写入错误。
 	SetFamilyProxy(ctx context.Context, familyID uint64, proxyID *uint64) error
@@ -82,21 +129,31 @@ type AccountRepository interface {
 	GetQuotaRecoveries(ctx context.Context, accountIDs []uint64) (map[uint64]account.QuotaRecovery, error)
 	UpsertByIdentity(ctx context.Context, value account.Credential) (account.Credential, bool, error)
 	Update(ctx context.Context, value account.Credential) (account.Credential, error)
-	UpdateMany(ctx context.Context, ids []uint64, updates AccountUpdates) (int64, error)
+	UpdateMany(ctx context.Context, provider account.Provider, ids []uint64, updates AccountUpdates) (int64, error)
 	Delete(ctx context.Context, id uint64) error
 	DeleteMany(ctx context.Context, ids []uint64) (int64, error)
+	// ResolveLinkedDeleteIDs expands root account IDs with one-hop (or Build/Console two-hop via Web)
+	// peers from link tables for optional linked deletion. It never guesses by email/name/userId.
+	ResolveLinkedDeleteIDs(ctx context.Context, provider account.Provider, rootIDs []uint64, targets []account.Provider) (LinkedDeleteResolution, error)
+	// DeleteManyWithLinked locks roots, resolves linked peers, checks media jobs, and deletes
+	// the final set inside a single DB transaction (avoids resolve/delete TOCTOU).
+	// skipMedia=false rejects on active media; skipMedia=true skips the complete root group.
+	DeleteManyWithLinked(ctx context.Context, provider account.Provider, rootIDs []uint64, targets []account.Provider, skipMedia bool) (LinkedDeleteOutcome, error)
+	// DeleteAccountStatusBatchWithLinked selects at most limit roots by state and ID cursor,
+	// expands links, skips protected groups, and returns the candidate count and next cursor.
+	DeleteAccountStatusBatchWithLinked(ctx context.Context, provider account.Provider, status string, now time.Time, afterID uint64, limit int, targets []account.Provider) (LinkedDeleteOutcome, int, uint64, error)
+	// CountCleanupWithLinked returns root and linked-peer counts using SQL COUNT queries only.
+	CountCleanupWithLinked(ctx context.Context, provider account.Provider, statuses []string, now time.Time, targets []account.Provider) (CleanupPreview, error)
 	// ListAutoCleanReauthCandidates 以 ID 游标列出达到清理年龄的 reauthRequired 账号。
 	ListAutoCleanReauthCandidates(ctx context.Context, markedBefore time.Time, includeDisabled bool, afterID uint64, limit int) ([]uint64, error)
 	// DeleteAutoCleanReauthCandidates 在事务内重新校验状态与年龄并跳过活动视频任务，返回实际删除 ID。
 	DeleteAutoCleanReauthCandidates(ctx context.Context, markedBefore time.Time, includeDisabled bool, candidateIDs []uint64) ([]uint64, error)
-	// DeleteAccountStatusBatch 删除当前仍匹配指定管理端状态的一批账号，并返回实际删除的 ID。
-	DeleteAccountStatusBatch(ctx context.Context, provider account.Provider, status string, now time.Time, limit int) ([]uint64, int, error)
 	UpdateTokens(ctx context.Context, id uint64, accessToken, refreshToken string, expiresAt time.Time) (account.Credential, error)
 	BackfillCredentialRefreshSchedules(ctx context.Context, now time.Time, limit int) (int, error)
 	ListCriticalCredentialRefreshIDs(ctx context.Context, now, expiresBefore time.Time, limit int) ([]uint64, error)
 	ListDueCredentialRefreshIDs(ctx context.Context, now time.Time, limit int) ([]uint64, error)
 	NextCredentialRefreshDueAt(ctx context.Context) (*time.Time, error)
-	UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failureCount int, retryAt time.Time, errorCode string, permanent bool) error
+	UpdateCredentialRefreshFailure(ctx context.Context, id uint64, failure CredentialRefreshFailure) error
 	UpdateObservedModel(ctx context.Context, id uint64, model string, observedAt time.Time) error
 	UpdateHealth(ctx context.Context, id uint64, failureCount int, cooldownUntil *time.Time, lastError string, success bool) error
 	// MarkBuildAPIFallback 幂等写入 Build 账号的 XAI 推理回退标记；非 Build 账号返回错误。
